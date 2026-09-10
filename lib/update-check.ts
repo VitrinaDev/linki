@@ -84,5 +84,6 @@ export function scheduleUpdateCheck() {
   checkForUpdate();
 
   // Then every 12 hours
-  setInterval(checkForUpdate, POLL_INTERVAL_MS);
+  // Do not keep short-lived CLI/test processes alive solely for update checks.
+  setInterval(checkForUpdate, POLL_INTERVAL_MS).unref();
 }

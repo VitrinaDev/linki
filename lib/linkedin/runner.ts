@@ -5,6 +5,8 @@ import { visitProfile } from "@/lib/linkedin/visit";
 import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError } from "@/lib/linkedin/connect";
 import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
 import { shouldSyncAccepted, syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
+import { shouldSyncRadarInbox, syncRadarInbox } from "@/lib/linkedin/sync-radar-replies";
+import { processRadarCallbacks } from "@/lib/radar/callbacks";
 import { sendEmail } from "@/lib/email/sender";
 import { shouldSyncEmailInbox, syncEmailInbox } from "@/lib/email/inbox";
 import { enrichProfile } from "@/lib/linkedin/enrich";
@@ -183,6 +185,8 @@ interface Target {
   email_replied_at: string | null;
   company_id: string | null;
   messaging_urn: string | null;
+  icebreaker_context: string | null;
+  radar_status: string | null;
 }
 
 interface Template { id: string; body: string; }
@@ -202,6 +206,7 @@ function renderTemplate(body: string, target: Target): string {
     .replace(/\{\{company\}\}/gi,    target.company ?? "")
     .replace(/\{\{title\}\}/gi,      target.title ?? "")
     .replace(/\{\{location\}\}/gi,   target.location ?? "")
+    .replace(/\{\{icebreaker_context\}\}/gi, target.icebreaker_context ?? "")
     .trim();
 }
 
@@ -477,7 +482,14 @@ async function executeStep(
   }
 
   // Auto-unenroll if lead has replied on either channel — mark ALL track-runs for this profile skipped
-  const replyCheck = db.prepare("SELECT last_replied_at, email_replied_at FROM targets WHERE id = ?").get(target.id) as { last_replied_at: string | null; email_replied_at: string | null };
+  const replyCheck = db.prepare("SELECT last_replied_at, email_replied_at, radar_status FROM targets WHERE id = ?").get(target.id) as { last_replied_at: string | null; email_replied_at: string | null; radar_status: string | null };
+  if (replyCheck?.radar_status === "PAUSED" || replyCheck?.radar_status === "REPLIED") {
+    log(db, runId, target.id, "info", `${target.full_name ?? target.linkedin_url} paused by Radar — unenrolling from workflow`);
+    db.prepare(
+      "UPDATE run_profile_tracks SET state = 'skipped', error_message = 'Paused by Radar' WHERE run_profile_id = ? AND state NOT IN ('completed', 'failed', 'skipped')"
+    ).run(tr.run_profile_id);
+    return;
+  }
   if (replyCheck?.last_replied_at || replyCheck?.email_replied_at) {
     const channel = replyCheck.email_replied_at ? "email" : "LinkedIn";
     log(db, runId, target.id, "info", `${target.full_name ?? target.linkedin_url} replied via ${channel} — unenrolling from workflow`);
@@ -947,10 +959,24 @@ async function globalLoop(): Promise<void> {
   const db = getDb();
 
   while (true) {
+    const radarAccountId = process.env.RADAR_LINKEDIN_ACCOUNT_ID?.trim();
+    if (radarAccountId && shouldSyncRadarInbox(radarAccountId)) {
+      try {
+        const replies = await syncRadarInbox(radarAccountId);
+        if (replies > 0) console.log(`[radar] LinkedIn inbox sync detected ${replies} new repl${replies === 1 ? "y" : "ies"}`);
+      } catch (err) {
+        console.error("[radar] Inbox sync error:", err instanceof Error ? err.message : err);
+      }
+    }
     try {
       await tick(db);
     } catch (err) {
       console.error("[runner] Tick error:", err instanceof Error ? err.message : err);
+    }
+    try {
+      await processRadarCallbacks(db);
+    } catch (err) {
+      console.error("[radar] Callback outbox error:", err instanceof Error ? err.message : err);
     }
     try {
       const { processScheduledImports } = await import("@/lib/import-jobs");
@@ -1181,6 +1207,7 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
      JOIN targets t ON t.id = rp.target_id
      WHERE rp.run_id IN (${placeholders})
        AND rt.state = 'in_progress'
+       AND COALESCE(t.radar_status, 'QUEUED') NOT IN ('PAUSED', 'REPLIED')
        AND (rt.next_step_at IS NULL OR datetime(rt.next_step_at) <= datetime('now'))
      ORDER BY rt.next_step_at ASC`
   ).all(...runIds) as TrackRun[];

@@ -17,6 +17,61 @@
 
 ---
 
+## Vitrina Radar integration
+
+This fork is the owned LinkedIn execution layer for Radar. It adds the exact
+`POST /api/contacts` and `PATCH /api/contacts/by-radar-lead-id/:id` contracts,
+durable signed callbacks for connection accepts and replies, the
+`{{icebreaker_context}}` template variable, and process-wide static proxy
+enforcement. The routes use the existing `x-internal-secret` authentication.
+
+### Four-founder deployment rules
+
+Run four isolated containers. Each container must have exactly one founder
+account, one persistent `/data` volume, and one static residential proxy. Never
+share a database, cookie state, internal secret, proxy credential, or hostname
+between founders. A stable proxy reduces IP drift; it cannot guarantee that
+LinkedIn will not challenge or restrict an account. Stop that container when a
+challenge or limit appears—do not rotate IPs or move its cookies elsewhere.
+
+For each `founder-N.env`, configure:
+
+```dotenv
+NEXTAUTH_URL=https://linki-founder-N.example.com
+NEXTAUTH_SECRET=<unique per container>
+AUTH_PASSWORD=<unique per container>
+INTERNAL_API_SECRET=<same secret Radar uses for this endpoint>
+LINKI_DB_PATH=/data/linki.db
+HEADLESS=true
+
+LINKI_REQUIRE_PROXY=true
+LINKI_PROXY_SERVER=http://static-residential-host:port
+LINKI_PROXY_USERNAME=<unique proxy user>
+LINKI_PROXY_PASSWORD=<unique proxy password>
+
+RADAR_WORKFLOW_ID=<LinkedIn-only workflow id from this container>
+RADAR_LINKEDIN_ACCOUNT_ID=<the sole account id from this container>
+RADAR_LIST_ID=radar_vitrina_active_campaign
+RADAR_CALLBACK_URL=https://radar.vitrinadev.com/api/webhooks/v1/omnichannel-callback
+RADAR_CALLBACK_SECRET=<same value as Radar OMNICHANNEL_WEBHOOK_SECRET>
+RADAR_REPLY_SYNC_INTERVAL_MINUTES=15
+```
+
+Authenticate the account through that same container only after its proxy is
+configured. Both interactive login and background Chromium receive the same
+proxy configuration. In the Linki UI, set the account to at most 15 connection
+requests/day and 20 messages/day, select local working hours/days, and create a
+LinkedIn-only workflow whose message template uses `{{icebreaker_context}}`.
+The integration also clamps the connection limit to 15 as a database-level
+defence. Start with a limit of 1 for an end-to-end callback test, then raise it.
+
+Pin deployments to `ghcr.io/vitrinadev/linki:v1.7.4-radar.1`; do not use the
+upstream `latest` image. Proxy credentials must stay in untracked `0600` env
+files or the deployment secret store and must never appear in logs or health
+checks.
+
+---
+
 <p align="center">
   <strong>▶ Full demo &nbsp;|&nbsp;</strong>
   <a href="https://youtu.be/S6n4RHULq3E">https://youtu.be/S6n4RHULq3E</a>

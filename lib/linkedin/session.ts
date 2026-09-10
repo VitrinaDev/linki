@@ -19,6 +19,21 @@ const LAUNCH_ARGS = [
   "--disable-gpu",
 ];
 
+function configuredProxy(): { server: string; username?: string; password?: string } | undefined {
+  const server = process.env.LINKI_PROXY_SERVER?.trim();
+  const username = process.env.LINKI_PROXY_USERNAME?.trim();
+  const password = process.env.LINKI_PROXY_PASSWORD?.trim();
+  const required = process.env.LINKI_REQUIRE_PROXY === "true" || Boolean(process.env.RADAR_WORKFLOW_ID);
+  if (!server) {
+    if (required) throw new Error("LINKI_PROXY_SERVER is required for this Radar LinkedIn runtime");
+    return undefined;
+  }
+  if (Boolean(username) !== Boolean(password)) {
+    throw new Error("LINKI_PROXY_USERNAME and LINKI_PROXY_PASSWORD must be configured together");
+  }
+  return { server, ...(username && password ? { username, password } : {}) };
+}
+
 /**
  * Shared browser-context fingerprint. Login and runtime MUST use the identical
  * options so the LinkedIn session is BORN under the exact fingerprint it will
@@ -50,6 +65,7 @@ async function getBrowser(headless = HEADLESS): Promise<Browser> {
       headless,
       executablePath: CHROMIUM_PATH,
       args: LAUNCH_ARGS,
+      proxy: configuredProxy(),
     });
   }
   return browser;
@@ -210,6 +226,7 @@ export async function authenticateAccount(accountId: string): Promise<void> {
   const visibleBrowser = await chromium.launch({
     headless: false,
     executablePath: CHROMIUM_PATH,
+    proxy: configuredProxy(),
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",

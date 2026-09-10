@@ -15,7 +15,7 @@ export function getDb(): Database.Database {
     db.pragma("foreign_keys = ON");
     initDb(db);
     runMigrations(db);
-    scheduleUpdateCheck();
+    if (process.env.LINKI_DISABLE_UPDATE_CHECK !== "true") scheduleUpdateCheck();
   }
   return db;
 }
@@ -472,6 +472,32 @@ function runMigrations(db: Database.Database) {
     "ALTER TABLE lists ADD COLUMN purpose TEXT",
     // Manual/CSV-only field — no automation reads or writes this, reference data only.
     "ALTER TABLE targets ADD COLUMN phone TEXT",
+    // Radar-owned omnichannel integration. radar_lead_id is the immutable
+    // cross-system identity; radar_status is re-checked immediately before
+    // every LinkedIn action so a cross-channel reply can stop queued work.
+    "ALTER TABLE targets ADD COLUMN radar_lead_id TEXT",
+    "ALTER TABLE targets ADD COLUMN icebreaker_context TEXT",
+    "ALTER TABLE targets ADD COLUMN radar_status TEXT DEFAULT 'QUEUED'",
+    "ALTER TABLE accounts ADD COLUMN radar_inbox_synced_at TEXT",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_targets_radar_lead_id ON targets(radar_lead_id) WHERE radar_lead_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_targets_radar_status ON targets(radar_status) WHERE radar_lead_id IS NOT NULL",
+    // Transactional callback outbox. Delivery is retried independently of the
+    // LinkedIn polling cycle, so a Radar outage cannot lose accept/reply events.
+    `CREATE TABLE IF NOT EXISTS radar_callback_outbox (
+      event_id TEXT PRIMARY KEY,
+      target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL CHECK(event_type IN ('connection.accepted', 'message.replied')),
+      occurred_at TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sending', 'sent')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
+      locked_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      sent_at TEXT
+    )`,
+    "CREATE INDEX IF NOT EXISTS idx_radar_callback_due ON radar_callback_outbox(status, next_attempt_at)",
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }
