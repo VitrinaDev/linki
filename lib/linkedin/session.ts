@@ -360,7 +360,7 @@ async function classifyLoginState(page: Page): Promise<LoginResult> {
         return {
           status: "challenge",
           kind: "captcha",
-          message: "LinkedIn requires a CAPTCHA, which can't be solved on the server. Use cookie paste instead.",
+          message: "LinkedIn requires a CAPTCHA, which can't be solved on the server. Keep outreach paused and retry the server login later.",
         };
       }
       // Device/app approval: a settled checkpoint with no code input and no captcha

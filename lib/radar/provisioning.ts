@@ -61,9 +61,28 @@ function resolveSingleAuthenticatedAccount(): string {
   return accounts[0].id;
 }
 
+function assertRuntimeCanEnable(accountId: string): void {
+  const db = getDb();
+  const account = db.prepare(
+    "SELECT is_authenticated FROM accounts WHERE id = ?",
+  ).get(accountId) as { is_authenticated: number } | undefined;
+  const proxyReady = process.env.LINKI_REQUIRE_PROXY === "true"
+    && Boolean(process.env.LINKI_PROXY_SERVER?.trim());
+  const callbackReady = Boolean(
+    process.env.RADAR_CALLBACK_URL?.trim() && process.env.RADAR_CALLBACK_SECRET?.trim(),
+  );
+  if (!account?.is_authenticated || !proxyReady || !callbackReady) {
+    throw new RadarProvisionError(
+      409,
+      "Cannot enable Radar outreach until authentication, required proxy, and callbacks are ready",
+    );
+  }
+}
+
 export function provisionRadarCampaign(input: RadarProvisionInput): RadarProvisionResult {
   const db = getDb();
   const accountId = resolveSingleAuthenticatedAccount();
+  if (input.outboundEnabled) assertRuntimeCanEnable(accountId);
   const workflowHash = managedWorkflowHash(input);
 
   return db.transaction(() => {
@@ -194,22 +213,7 @@ export function controlRadarRuntime(input: RadarControlInput): RadarControlResul
     `).get() as { list_id: string; workflow_id: string; account_id: string } | undefined;
     if (!managed) throw new RadarProvisionError(409, "Radar campaign has not been provisioned");
 
-    if (input.enabled) {
-      const account = db.prepare(
-        "SELECT is_authenticated FROM accounts WHERE id = ?",
-      ).get(managed.account_id) as { is_authenticated: number } | undefined;
-      const proxyReady = process.env.LINKI_REQUIRE_PROXY === "true"
-        && Boolean(process.env.LINKI_PROXY_SERVER?.trim());
-      const callbackReady = Boolean(
-        process.env.RADAR_CALLBACK_URL?.trim() && process.env.RADAR_CALLBACK_SECRET?.trim(),
-      );
-      if (!account?.is_authenticated || !proxyReady || !callbackReady) {
-        throw new RadarProvisionError(
-          409,
-          "Cannot enable Radar outreach until authentication, required proxy, and callbacks are ready",
-        );
-      }
-    }
+    if (input.enabled) assertRuntimeCanEnable(managed.account_id);
 
     const connectionLimit = input.enabled ? input.dailyConnectionLimit : 0;
     const messageLimit = input.enabled ? input.dailyMessageLimit : 0;

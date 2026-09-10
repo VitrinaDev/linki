@@ -94,6 +94,12 @@ test("provisions the managed list, workflow, binding, and conservative account p
 });
 
 test("enforces a hard runtime pause and can explicitly retry failed managed tracks", () => {
+  assert.throws(
+    () => provisionRadarCampaign({ ...manifest, outboundEnabled: true }),
+    /required proxy, and callbacks/,
+  );
+  assert.equal(getRadarRuntimeStatus().campaign?.outbound_enabled, 0);
+
   db.prepare("INSERT INTO targets (id, linkedin_url) VALUES ('target-1', 'https://www.linkedin.com/in/target-1')").run();
   db.prepare(`
     INSERT INTO runs (id, workflow_id, list_id, account_id, status)
