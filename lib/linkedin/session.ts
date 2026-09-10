@@ -4,6 +4,7 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { getDb } from "@/lib/db";
 import { encryptSecret, decryptSecret } from "@/lib/crypto";
 import { radarRequiresProxy } from "@/lib/radar/config";
+import { browserContextOptions } from "@/lib/linkedin/fingerprint";
 
 chromium.use(StealthPlugin());
 
@@ -40,19 +41,6 @@ function configuredProxy(): { server: string; username?: string; password?: stri
  * options so the LinkedIn session is BORN under the exact fingerprint it will
  * later be used with — a mismatch (or a drift) triggers a forced re-auth.
  */
-function contextOptions(storageState?: object) {
-  return {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    storageState: storageState as any,
-    viewport: { width: 1920, height: 1080 },
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    locale: "en-US",
-    timezoneId: "America/New_York",
-    permissions: ["clipboard-read", "clipboard-write"] as ("clipboard-read" | "clipboard-write")[],
-  };
-}
-
 async function getBrowser(headless = HEADLESS): Promise<Browser> {
   // B1: if the cached browser is disconnected, CLOSE it before relaunching.
   // Without this, a dead-but-not-reaped chromium process tree is orphaned on
@@ -75,7 +63,7 @@ async function getBrowser(headless = HEADLESS): Promise<Browser> {
 async function getOrCreateContext(accountId: string): Promise<BrowserContext> {
   const db = getDb();
   const account = db.prepare("SELECT * FROM accounts WHERE id = ?").get(accountId) as
-    | { cookies_json: string | null; email: string }
+    | { cookies_json: string | null; email: string; timezone: string | null }
     | undefined;
 
   if (!account) throw new Error(`Account ${accountId} not found`);
@@ -92,7 +80,7 @@ async function getOrCreateContext(accountId: string): Promise<BrowserContext> {
       }
     }
 
-    const ctx = await b.newContext(contextOptions(storageState));
+    const ctx = await b.newContext(browserContextOptions(storageState, account.timezone));
 
     // Auto-evict from map when context closes for any reason (crash, session expiry, etc.)
     ctx.on("close", () => { if (contexts.get(accountId) === ctx) contexts.delete(accountId); });
@@ -216,7 +204,7 @@ export async function markNeedsReauth(accountId: string): Promise<void> {
 export async function authenticateAccount(accountId: string): Promise<void> {
   const db = getDb();
   const account = db.prepare("SELECT * FROM accounts WHERE id = ?").get(accountId) as
-    | { email: string }
+    | { email: string; timezone: string | null }
     | undefined;
   if (!account) throw new Error(`Account ${accountId} not found`);
 
@@ -238,11 +226,8 @@ export async function authenticateAccount(accountId: string): Promise<void> {
 
   try {
     const ctx = await visibleBrowser.newContext({
+      ...browserContextOptions(undefined, account.timezone),
       viewport: { width: 1440, height: 900 },
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      locale: "en-US",
-      timezoneId: "America/New_York",
     });
 
     const page = await ctx.newPage();
@@ -416,8 +401,13 @@ export async function startHeadlessLogin(
   sweepPendingLogins();
   await clearPendingLogin(accountId);
 
+  const account = getDb().prepare("SELECT timezone FROM accounts WHERE id = ?").get(accountId) as
+    | { timezone: string | null }
+    | undefined;
+  if (!account) return { status: "error", message: `Account ${accountId} not found` };
+
   const b = await getBrowser(true);
-  const ctx = await b.newContext(contextOptions());
+  const ctx = await b.newContext(browserContextOptions(undefined, account.timezone));
   const page = await ctx.newPage();
   try {
     await page.goto("https://www.linkedin.com/login", { waitUntil: "domcontentloaded", timeout: 30_000 });

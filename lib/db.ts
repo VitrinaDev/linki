@@ -498,6 +498,16 @@ function runMigrations(db: Database.Database) {
       sent_at TEXT
     )`,
     "CREATE INDEX IF NOT EXISTS idx_radar_callback_due ON radar_callback_outbox(status, next_attempt_at)",
+    // Runtime-owned binding installed by Radar through /api/radar/provision.
+    // This replaces UI-created lists/workflows and env-bound local database IDs.
+    `CREATE TABLE IF NOT EXISTS radar_runtime_config (
+      id INTEGER PRIMARY KEY CHECK(id = 1),
+      list_id TEXT NOT NULL REFERENCES lists(id),
+      workflow_id TEXT NOT NULL REFERENCES workflows(id),
+      account_id TEXT NOT NULL REFERENCES accounts(id),
+      workflow_sha256 TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`,
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }
