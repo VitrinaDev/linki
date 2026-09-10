@@ -66,7 +66,7 @@ LinkedIn-only workflow whose message template uses `{{icebreaker_context}}`.
 The integration also clamps the connection limit to 15 as a database-level
 defence. Start with a limit of 1 for an end-to-end callback test, then raise it.
 
-Pin deployments to `ghcr.io/vitrinadev/linki:v1.7.4-radar.1`; do not use the
+Pin deployments to `ghcr.io/vitrinadev/linki:v1.7.4-radar.2`; do not use the
 upstream `latest` image. Proxy credentials must stay in untracked `0600` env
 files or the deployment secret store and must never appear in logs or health
 checks.
@@ -201,7 +201,7 @@ docker run -d -p 3456:3000 \
   -e NEXTAUTH_SECRET=your_random_secret_here \
   -e AUTH_PASSWORD=your_password_here \
   -v $(pwd)/data:/data \
-  ghcr.io/vitrinadev/linki:v1.7.4-radar.1
+  ghcr.io/vitrinadev/linki:v1.7.4-radar.2
 ```
 
 Linki is now running at `http://localhost:3456`. The SQLite database is persisted in `./data/linki.db` on your host machine.
