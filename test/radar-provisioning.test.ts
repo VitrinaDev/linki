@@ -105,12 +105,18 @@ test("enforces a hard runtime pause and can explicitly retry failed managed trac
     VALUES ('track-1', 'profile-1', 'linkedin', 'failed', 'temporary failure')
   `).run();
 
-  const enabled = controlRadarRuntime({
+  const enableInput = {
     enabled: true,
     dailyConnectionLimit: 2,
     dailyMessageLimit: 3,
     retryFailed: true,
-  });
+  };
+  assert.throws(() => controlRadarRuntime(enableInput), /required proxy, and callbacks/);
+  process.env.LINKI_REQUIRE_PROXY = "true";
+  process.env.LINKI_PROXY_SERVER = "http://proxy.example:1234";
+  process.env.RADAR_CALLBACK_URL = "https://radar.example/callback";
+  process.env.RADAR_CALLBACK_SECRET = "callback-secret";
+  const enabled = controlRadarRuntime(enableInput);
   assert.deepEqual(enabled, {
     enabled: true,
     dailyConnectionLimit: 2,
@@ -139,6 +145,10 @@ test("enforces a hard runtime pause and can explicitly retry failed managed trac
   assert.deepEqual(db.prepare("SELECT outbound_enabled FROM radar_runtime_config WHERE id = 1").get(), { outbound_enabled: 0 });
   db.prepare("DELETE FROM runs WHERE id = 'run-1'").run();
   db.prepare("DELETE FROM targets WHERE id = 'target-1'").run();
+  delete process.env.LINKI_REQUIRE_PROXY;
+  delete process.env.LINKI_PROXY_SERVER;
+  delete process.env.RADAR_CALLBACK_URL;
+  delete process.env.RADAR_CALLBACK_SECRET;
 });
 
 test("reports a secret-free runtime status and preserves authentication on metadata updates", () => {

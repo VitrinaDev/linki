@@ -83,7 +83,8 @@ export function getRadarRuntimeStatus() {
     accountCount: accounts.length,
     campaign: managed ?? null,
     queue,
-    proxyConfigured: Boolean(process.env.LINKI_PROXY_SERVER?.trim()),
+    proxyConfigured: process.env.LINKI_REQUIRE_PROXY === "true"
+      && Boolean(process.env.LINKI_PROXY_SERVER?.trim()),
     callbackConfigured: Boolean(
       process.env.RADAR_CALLBACK_URL?.trim() && process.env.RADAR_CALLBACK_SECRET?.trim(),
     ),

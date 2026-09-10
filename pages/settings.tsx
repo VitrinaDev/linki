@@ -232,8 +232,6 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
   const [form, setForm] = useState(BLANK_LI_FORM);
   const [loading, setLoading] = useState(false);
   const [authModal, setAuthModal] = useState<string | null>(null);
-  const [authMode, setAuthMode] = useState<"login" | "cookies">("login");
-  const [authForm, setAuthForm] = useState({ li_at: "", document_cookie: "" });
   const [loginForm, setLoginForm] = useState({ email: "", password: "", code: "" });
   const [loginStage, setLoginStage] = useState<"creds" | "code" | "approve">("creds");
   const [challengeMsg, setChallengeMsg] = useState("");
@@ -241,11 +239,9 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
 
   function openAuthModal(account: LiAccount) {
     setAuthModal(account.id);
-    setAuthMode("login");
     setLoginStage("creds");
     setChallengeMsg("");
     setLoginForm({ email: account.email ?? "", password: "", code: "" });
-    setAuthForm({ li_at: "", document_cookie: "" });
   }
 
   function closeAuthModal() {
@@ -253,7 +249,6 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
     setLoginStage("creds");
     setChallengeMsg("");
     setLoginForm({ email: "", password: "", code: "" });
-    setAuthForm({ li_at: "", document_cookie: "" });
   }
 
   async function submitLogin(e: React.FormEvent) {
@@ -279,8 +274,8 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
       closeAuthModal();
       refresh();
     } else if (data.status === "challenge" && data.kind === "captcha") {
-      toast.error(data.message);
-      setAuthMode("cookies");
+      toast.error(data.message ?? "LinkedIn requested a captcha. Retry later from Radar.");
+      closeAuthModal();
     } else if (data.status === "challenge") {
       setChallengeMsg(data.message ?? "");
       if (data.kind === "app") {
@@ -349,22 +344,6 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
     await fetch(`/api/accounts/${id}`, { method: "DELETE" });
     toast.success("Deleted");
     setAccounts((prev) => prev.filter((a) => a.id !== id));
-  }
-
-  async function submitAuth(e: React.FormEvent) {
-    e.preventDefault();
-    if (!authModal) return;
-    setAuthLoading(true);
-    const res = await fetch(`/api/accounts/${authModal}/authenticate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(authForm),
-    });
-    setAuthLoading(false);
-    if (!res.ok) { toast.error((await res.json()).error ?? "Authentication failed"); return; }
-    toast.success("Account authenticated");
-    closeAuthModal();
-    refresh();
   }
 
   return (
@@ -534,26 +513,7 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
           <div className="modal-box bg-base-200 border border-base-300/50 max-w-lg">
             <h3 className="font-semibold text-base mb-1">Authenticate LinkedIn Account</h3>
 
-            {/* Mode toggle */}
-            <div className="inline-flex rounded-lg bg-base-300/50 p-0.5 mb-4 mt-2">
-              <button
-                type="button"
-                onClick={() => { setAuthMode("login"); setLoginStage("creds"); }}
-                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${authMode === "login" ? "bg-primary text-primary-content" : "text-base-content/60 hover:text-base-content"}`}
-              >
-                Server login
-              </button>
-              <button
-                type="button"
-                onClick={() => setAuthMode("cookies")}
-                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${authMode === "cookies" ? "bg-primary text-primary-content" : "text-base-content/60 hover:text-base-content"}`}
-              >
-                Paste cookies
-              </button>
-            </div>
-
-            {authMode === "login" ? (
-              <form onSubmit={submitLogin} className="flex flex-col gap-3">
+            <form onSubmit={submitLogin} className="mt-4 flex flex-col gap-3">
                 <p className="text-xs text-base-content/50 -mt-1">
                   Logs in on the server under the runner&apos;s exact browser fingerprint and captures all cookies. LinkedIn may ask for a code or a device approval.
                 </p>
@@ -586,34 +546,7 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
                     {authLoading ? <span className="loading loading-spinner loading-xs" /> : loginStage === "creds" ? "Log in" : loginStage === "approve" ? "I approved — Continue" : "Verify code"}
                   </button>
                 </div>
-              </form>
-            ) : (
-              <>
-                <div className="bg-base-300/50 rounded-lg p-3 text-xs text-base-content/60 mb-4 space-y-1.5">
-                  <p className="font-medium text-base-content/80">How to get your cookies:</p>
-                  <p>1. Open <strong>linkedin.com</strong> in Chrome and make sure you are logged in</p>
-                  <p>2. Open DevTools → <strong>Application</strong> → <strong>Cookies</strong> → <strong>https://www.linkedin.com</strong></p>
-                  <p>3. Find <strong>li_at</strong> → double-click the Value cell → copy it → paste below</p>
-                  <p>4. Open the DevTools <strong>Console</strong> tab → run <code className="bg-base-300 px-1 rounded">document.cookie</code> → copy the output → paste below</p>
-                </div>
-                <form onSubmit={submitAuth} className="flex flex-col gap-3">
-                  <div>
-                    <label className="label text-xs text-base-content/50 pb-1">li_at cookie value <span className="text-error">*</span></label>
-                    <input className="input input-bordered input-sm w-full bg-base-300/50 font-mono text-xs" placeholder="AQEDATxxxxxx..." value={authForm.li_at} onChange={(e) => setAuthForm({ ...authForm, li_at: e.target.value })} required />
-                  </div>
-                  <div>
-                    <label className="label text-xs text-base-content/50 pb-1">document.cookie output (optional)</label>
-                    <textarea className="textarea textarea-bordered w-full bg-base-300/50 font-mono text-xs h-24 resize-none" placeholder={'bcookie="v=2&..."; JSESSIONID="ajax:..."; ...'} value={authForm.document_cookie} onChange={(e) => setAuthForm({ ...authForm, document_cookie: e.target.value })} />
-                  </div>
-                  <div className="modal-action mt-1">
-                    <button type="button" className="inline-flex items-center px-3 py-1.5 rounded-lg text-sm text-base-content/60 hover:text-base-content hover:bg-base-300/50 transition-colors" onClick={closeAuthModal}>Cancel</button>
-                    <button type="submit" className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-sm font-medium bg-primary text-primary-content hover:bg-primary/90 transition-colors disabled:opacity-50" disabled={authLoading}>
-                      {authLoading ? <span className="loading loading-spinner loading-xs" /> : "Save Cookies"}
-                    </button>
-                  </div>
-                </form>
-              </>
-            )}
+            </form>
           </div>
           <div className="modal-backdrop" onClick={closeAuthModal} />
         </div>
@@ -1569,9 +1502,10 @@ function McpCard() {
   const [mcpUrl, setMcpUrl] = useState("");
 
   useEffect(() => {
-    if (typeof window !== "undefined") {
+    const frame = window.requestAnimationFrame(() => {
       setMcpUrl(`${window.location.origin}/api/mcp`);
-    }
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, []);
 
   async function copy(text: string) {

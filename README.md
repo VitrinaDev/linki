@@ -68,7 +68,7 @@ account to zero sends while paused, changes limits, and can retry failed tracks.
 Start with 1 connection/day and 1 message/day and `enabled:false`; after a
 controlled test, opt in and raise gradually, never above 15/20.
 
-Pin deployments to `ghcr.io/vitrinadev/linki:v1.7.4-radar.5`; do not use the
+Pin deployments to `ghcr.io/vitrinadev/linki:v1.7.4-radar.6`; do not use the
 upstream `latest` image. Proxy credentials must stay in untracked `0600` env
 files or the deployment secret store and must never appear in logs or health
 checks.
@@ -203,7 +203,7 @@ docker run -d -p 3456:3000 \
   -e NEXTAUTH_SECRET=your_random_secret_here \
   -e AUTH_PASSWORD=your_password_here \
   -v $(pwd)/data:/data \
-  ghcr.io/vitrinadev/linki:v1.7.4-radar.5
+  ghcr.io/vitrinadev/linki:v1.7.4-radar.6
 ```
 
 Linki is now running at `http://localhost:3456`. The SQLite database is persisted in `./data/linki.db` on your host machine.
