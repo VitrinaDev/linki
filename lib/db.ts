@@ -477,7 +477,7 @@ function runMigrations(db: Database.Database) {
     // every LinkedIn action so a cross-channel reply can stop queued work.
     "ALTER TABLE targets ADD COLUMN radar_lead_id TEXT",
     "ALTER TABLE targets ADD COLUMN icebreaker_context TEXT",
-    "ALTER TABLE targets ADD COLUMN radar_status TEXT DEFAULT 'QUEUED'",
+    "ALTER TABLE targets ADD COLUMN radar_status TEXT DEFAULT 'QUEUED' CHECK(radar_status IN ('QUEUED', 'CONNECTED', 'REPLIED', 'PAUSED'))",
     "ALTER TABLE accounts ADD COLUMN radar_inbox_synced_at TEXT",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_targets_radar_lead_id ON targets(radar_lead_id) WHERE radar_lead_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_targets_radar_status ON targets(radar_status) WHERE radar_lead_id IS NOT NULL",

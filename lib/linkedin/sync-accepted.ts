@@ -1,6 +1,7 @@
 import type { Page } from "playwright";
 import { getDb } from "@/lib/db";
 import { getSessionPage, saveSessionState, markNeedsReauth } from "@/lib/linkedin/session";
+import { getOptionalRadarConfig } from "@/lib/radar/config";
 
 /**
  * Accepted-connection sync via the authoritative Voyager connections API.
@@ -48,7 +49,14 @@ export function shouldSyncAccepted(accountId: string): boolean {
     | { accepted_sync_at: string | null }
     | undefined;
   if (!row?.accepted_sync_at) return true;
-  return Date.now() - new Date(row.accepted_sync_at).getTime() >= ACCEPTED_SYNC_INTERVAL_MS;
+  const radarConfig = getOptionalRadarConfig();
+  const configuredMinutes = Number(process.env.RADAR_ACCEPTED_SYNC_INTERVAL_MINUTES ?? 5);
+  const radarInterval = Math.max(5, Number.isFinite(configuredMinutes) ? configuredMinutes : 5) * 60_000;
+  const interval = radarConfig?.accountId === accountId ? radarInterval : ACCEPTED_SYNC_INTERVAL_MS;
+  const syncedAt = /(?:Z|[+-]\d\d:\d\d)$/i.test(row.accepted_sync_at)
+    ? Date.parse(row.accepted_sync_at)
+    : Date.parse(`${row.accepted_sync_at.replace(" ", "T")}Z`);
+  return Date.now() - syncedAt >= interval;
 }
 
 interface ApiConnection {

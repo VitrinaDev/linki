@@ -3,6 +3,7 @@ import type { Browser, BrowserContext, Page } from "playwright";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { getDb } from "@/lib/db";
 import { encryptSecret, decryptSecret } from "@/lib/crypto";
+import { radarRequiresProxy } from "@/lib/radar/config";
 
 chromium.use(StealthPlugin());
 
@@ -23,7 +24,7 @@ function configuredProxy(): { server: string; username?: string; password?: stri
   const server = process.env.LINKI_PROXY_SERVER?.trim();
   const username = process.env.LINKI_PROXY_USERNAME?.trim();
   const password = process.env.LINKI_PROXY_PASSWORD?.trim();
-  const required = process.env.LINKI_REQUIRE_PROXY === "true" || Boolean(process.env.RADAR_WORKFLOW_ID);
+  const required = radarRequiresProxy();
   if (!server) {
     if (required) throw new Error("LINKI_PROXY_SERVER is required for this Radar LinkedIn runtime");
     return undefined;

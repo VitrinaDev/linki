@@ -7,6 +7,8 @@ import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
 import { shouldSyncAccepted, syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
 import { shouldSyncRadarInbox, syncRadarInbox } from "@/lib/linkedin/sync-radar-replies";
 import { processRadarCallbacks } from "@/lib/radar/callbacks";
+import { getOptionalRadarConfig } from "@/lib/radar/config";
+import type { RadarStatus } from "@/lib/radar/contracts";
 import { sendEmail } from "@/lib/email/sender";
 import { shouldSyncEmailInbox, syncEmailInbox } from "@/lib/email/inbox";
 import { enrichProfile } from "@/lib/linkedin/enrich";
@@ -186,7 +188,7 @@ interface Target {
   company_id: string | null;
   messaging_urn: string | null;
   icebreaker_context: string | null;
-  radar_status: string | null;
+  radar_status: RadarStatus | null;
 }
 
 interface Template { id: string; body: string; }
@@ -364,7 +366,7 @@ async function ensureSalesNavEnriched(db: ReturnType<typeof getDb>, target: Targ
   }
 }
 
-async function ensureApolloEnriched(db: ReturnType<typeof getDb>, target: Target, runId: string): Promise<void> {
+async function ensureApolloEnriched(db: ReturnType<typeof getDb>, target: Target, _runId: string): Promise<void> {
   const fresh = db.prepare("SELECT apollo_enriched_at, email, linkedin_url, sales_nav_url FROM targets WHERE id = ?").get(target.id) as { apollo_enriched_at: string | null; email: string | null; linkedin_url: string | null; sales_nav_url: string | null } | undefined;
   if (!fresh || fresh.apollo_enriched_at || fresh.email) return;
   const apolloUrl = fresh.linkedin_url?.includes("/in/") ? fresh.linkedin_url : fresh.sales_nav_url;
@@ -959,7 +961,7 @@ async function globalLoop(): Promise<void> {
   const db = getDb();
 
   while (true) {
-    const radarAccountId = process.env.RADAR_LINKEDIN_ACCOUNT_ID?.trim();
+    const radarAccountId = getOptionalRadarConfig()?.accountId;
     if (radarAccountId && shouldSyncRadarInbox(radarAccountId)) {
       try {
         const replies = await syncRadarInbox(radarAccountId);
@@ -1030,6 +1032,9 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
   // account. Sets targets.last_replied_at so the runner auto-unenrolls repliers.
   // LinkedIn reply detection is a premium feature (AI classifier layer) — no-op without ee/.
   for (const accountId of seenAccounts) {
+    // Radar accounts use the native open-core inbox poll above. Do not run a
+    // second premium transport poll against the same LinkedIn session.
+    if (accountId === getOptionalRadarConfig()?.accountId) continue;
     if (premium?.replies?.shouldSyncInbox(accountId)) {
       try {
         console.log(`[runner] Starting LinkedIn inbox sync for account ${accountId}`);

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { buildRadarCallback, callbackSignature, retryDelaySeconds, type RadarCallbackEventType } from "./contracts";
+import { getOptionalRadarConfig, getRadarCallbackConfig } from "./config";
 
 interface RadarEventSource {
   target_id: string;
@@ -88,10 +89,9 @@ function claimDueRows(db: Database.Database): OutboxRow[] {
 export async function processRadarCallbacks(db: Database.Database): Promise<void> {
   harvestRadarCallbacks(db);
 
-  const callbackUrl = process.env.RADAR_CALLBACK_URL?.trim();
-  const secret = process.env.RADAR_CALLBACK_SECRET?.trim();
-  if (!callbackUrl || !secret) {
-    if (!warnedMissingConfig && process.env.RADAR_WORKFLOW_ID) {
+  const callback = getRadarCallbackConfig();
+  if (!callback) {
+    if (!warnedMissingConfig && getOptionalRadarConfig()) {
       warnedMissingConfig = true;
       console.warn("[radar] Callbacks disabled: RADAR_CALLBACK_URL and RADAR_CALLBACK_SECRET are required");
     }
@@ -100,9 +100,9 @@ export async function processRadarCallbacks(db: Database.Database): Promise<void
 
   for (const row of claimDueRows(db)) {
     const timestamp = String(Math.floor(Date.now() / 1000));
-    const signature = callbackSignature(secret, timestamp, row.payload_json);
+    const signature = callbackSignature(callback.secret, timestamp, row.payload_json);
     try {
-      const response = await fetch(callbackUrl, {
+      const response = await fetch(callback.url, {
         method: "POST",
         headers: {
           "content-type": "application/json",

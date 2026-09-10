@@ -54,6 +54,7 @@ RADAR_LINKEDIN_ACCOUNT_ID=<the sole account id from this container>
 RADAR_LIST_ID=radar_vitrina_active_campaign
 RADAR_CALLBACK_URL=https://radar.vitrinadev.com/api/webhooks/v1/omnichannel-callback
 RADAR_CALLBACK_SECRET=<same value as Radar OMNICHANNEL_WEBHOOK_SECRET>
+RADAR_ACCEPTED_SYNC_INTERVAL_MINUTES=5
 RADAR_REPLY_SYNC_INTERVAL_MINUTES=15
 ```
 

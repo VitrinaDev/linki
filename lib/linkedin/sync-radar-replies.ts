@@ -1,6 +1,7 @@
 import type { Page } from "playwright";
 import { getDb } from "@/lib/db";
 import { getSessionPage, markNeedsReauth, saveSessionState } from "./session";
+import { getOptionalRadarConfig } from "@/lib/radar/config";
 
 const DEFAULT_INTERVAL_MINUTES = 15;
 const CONVERSATION_COUNT = 100;
@@ -45,7 +46,7 @@ function intervalMs(): number {
 }
 
 export function shouldSyncRadarInbox(accountId: string): boolean {
-  if (!process.env.RADAR_WORKFLOW_ID || process.env.RADAR_LINKEDIN_ACCOUNT_ID !== accountId) return false;
+  if (getOptionalRadarConfig()?.accountId !== accountId) return false;
   const row = getDb().prepare("SELECT radar_inbox_synced_at FROM accounts WHERE id = ?").get(accountId) as
     | { radar_inbox_synced_at: string | null }
     | undefined;

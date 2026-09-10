@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { before } from "node:test";
@@ -15,6 +16,9 @@ let db: Db;
 let enrollRadarContact: EnrollmentModule["enrollRadarContact"];
 let pauseRadarContact: EnrollmentModule["pauseRadarContact"];
 let harvestRadarCallbacks: typeof import("../lib/radar/callbacks")["harvestRadarCallbacks"];
+let processRadarCallbacks: typeof import("../lib/radar/callbacks")["processRadarCallbacks"];
+let callbackSignature: typeof import("../lib/radar/contracts")["callbackSignature"];
+let shouldSyncAccepted: typeof import("../lib/linkedin/sync-accepted")["shouldSyncAccepted"];
 const config = {
   listId: "radar_vitrina_active_campaign",
   workflowId: "radar-workflow",
@@ -37,10 +41,15 @@ before(async () => {
   const dbModule = await import("../lib/db");
   const enrollmentModule = await import("../lib/radar/enrollment");
   const callbacksModule = await import("../lib/radar/callbacks");
+  const acceptedModule = await import("../lib/linkedin/sync-accepted");
+  const contractsModule = await import("../lib/radar/contracts");
   db = dbModule.getDb();
   enrollRadarContact = enrollmentModule.enrollRadarContact;
   pauseRadarContact = enrollmentModule.pauseRadarContact;
   harvestRadarCallbacks = callbacksModule.harvestRadarCallbacks;
+  processRadarCallbacks = callbacksModule.processRadarCallbacks;
+  shouldSyncAccepted = acceptedModule.shouldSyncAccepted;
+  callbackSignature = contractsModule.callbackSignature;
 
   db.prepare(`
     INSERT INTO accounts (id, name, email, daily_connection_limit)
@@ -73,6 +82,17 @@ test("enrolls idempotently in the configured Radar run and clamps the account li
   assert.equal(account.daily_connection_limit, 15);
   const track = db.prepare("SELECT state FROM run_profile_tracks").get() as { state: string };
   assert.equal(track.state, "pending");
+  assert.throws(() => db.prepare("UPDATE targets SET radar_status = 'INVALID' WHERE id = ?").run(first.id));
+});
+
+test("polls Radar connection acceptances on the five-minute near-real-time interval", () => {
+  process.env.RADAR_WORKFLOW_ID = config.workflowId;
+  process.env.RADAR_LINKEDIN_ACCOUNT_ID = config.accountId;
+  process.env.RADAR_ACCEPTED_SYNC_INTERVAL_MINUTES = "5";
+  db.prepare("UPDATE accounts SET accepted_sync_at = datetime('now') WHERE id = ?").run(config.accountId);
+  assert.equal(shouldSyncAccepted(config.accountId), false);
+  db.prepare("UPDATE accounts SET accepted_sync_at = datetime('now', '-6 minutes') WHERE id = ?").run(config.accountId);
+  assert.equal(shouldSyncAccepted(config.accountId), true);
 });
 
 test("durably queues callbacks and pauses all active tracks", () => {
@@ -89,4 +109,36 @@ test("durably queues callbacks and pauses all active tracks", () => {
   const track = db.prepare("SELECT state FROM run_profile_tracks").get() as { state: string };
   assert.equal(paused.radar_status, "PAUSED");
   assert.equal(track.state, "skipped");
+});
+
+test("delivers the durable callback with Radar's exact HMAC headers", async () => {
+  let received: { body: string; timestamp: string; signature: string } | null = null;
+  const server = createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      received = {
+        body,
+        timestamp: String(request.headers["x-omnichannel-timestamp"]),
+        signature: String(request.headers["x-omnichannel-signature"]),
+      };
+      response.writeHead(204).end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  process.env.RADAR_CALLBACK_URL = `http://127.0.0.1:${address.port}/callback`;
+  process.env.RADAR_CALLBACK_SECRET = "test-callback-secret";
+  try {
+    await processRadarCallbacks(db);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+  assert.ok(received);
+  const delivery = received as { body: string; timestamp: string; signature: string };
+  assert.equal(delivery.signature, callbackSignature(process.env.RADAR_CALLBACK_SECRET, delivery.timestamp, delivery.body));
+  const row = db.prepare("SELECT status, attempts FROM radar_callback_outbox").get() as { status: string; attempts: number };
+  assert.deepEqual(row, { status: "sent", attempts: 1 });
 });

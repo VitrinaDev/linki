@@ -1,7 +1,9 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac } from "node:crypto";
 import { z } from "zod";
 
 export const DEFAULT_RADAR_LIST_ID = "radar_vitrina_active_campaign";
+export const RADAR_STATUSES = ["QUEUED", "CONNECTED", "REPLIED", "PAUSED"] as const;
+export type RadarStatus = typeof RADAR_STATUSES[number];
 
 export const radarContactSchema = z.object({
   firstName: z.string().trim().min(1).max(200),
@@ -60,12 +62,6 @@ export function buildRadarCallback(
 
 export function callbackSignature(secret: string, timestamp: string, rawBody: string): string {
   return `sha256=${createHmac("sha256", secret).update(`${timestamp}.${rawBody}`).digest("hex")}`;
-}
-
-export function signaturesMatch(expected: string, actual: string): boolean {
-  const a = Buffer.from(expected);
-  const b = Buffer.from(actual);
-  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 export function retryDelaySeconds(attempts: number): number {
