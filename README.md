@@ -23,7 +23,9 @@ This fork is the owned LinkedIn execution layer for Radar. It adds the exact
 `POST /api/contacts` and `PATCH /api/contacts/by-radar-lead-id/:id` contracts,
 durable signed callbacks for connection accepts and replies, the
 `{{icebreaker_context}}` template variable, and process-wide static proxy
-enforcement. The routes use the existing `x-internal-secret` authentication.
+enforcement. Radar owns account setup, authentication, runtime health, limits,
+and the managed list/workflow through `/api/radar/*`; operators do not need the
+Linki UI. The routes use the existing `x-internal-secret` authentication.
 
 ### Four-founder deployment rules
 
@@ -49,24 +51,24 @@ LINKI_PROXY_SERVER=http://static-residential-host:port
 LINKI_PROXY_USERNAME=<unique proxy user>
 LINKI_PROXY_PASSWORD=<unique proxy password>
 
-RADAR_WORKFLOW_ID=<LinkedIn-only workflow id from this container>
-RADAR_LINKEDIN_ACCOUNT_ID=<the sole account id from this container>
-RADAR_LIST_ID=radar_vitrina_active_campaign
 RADAR_CALLBACK_URL=https://radar.vitrinadev.com/api/webhooks/v1/omnichannel-callback
 RADAR_CALLBACK_SECRET=<same value as Radar OMNICHANNEL_WEBHOOK_SECRET>
 RADAR_ACCEPTED_SYNC_INTERVAL_MINUTES=5
 RADAR_REPLY_SYNC_INTERVAL_MINUTES=15
 ```
 
-Authenticate the account through that same container only after its proxy is
-configured. Both interactive login and background Chromium receive the same
-proxy configuration. In the Linki UI, set the account to at most 15 connection
-requests/day and 20 messages/day, select local working hours/days, and create a
-LinkedIn-only workflow whose message template uses `{{icebreaker_context}}`.
-The integration also clamps the connection limit to 15 as a database-level
-defence. Start with a limit of 1 for an end-to-end callback test, then raise it.
+Authenticate from Radar's `/linkedin` screen only after the runtime proxy is
+configured. Radar forwards the password once to the isolated server-side login;
+it never stores it and never moves cookies between machines. Interactive login
+and background Chromium receive the same proxy configuration. Before delivering
+contacts, Radar calls `PUT /api/radar/provision`, which idempotently creates the
+managed list, workflow and steps and applies local working hours plus limits.
+Radar's `PUT /api/radar/control` hard-pauses/resumes managed runs, clamps the
+account to zero sends while paused, changes limits, and can retry failed tracks.
+Start with 1 connection/day and 1 message/day and `enabled:false`; after a
+controlled test, opt in and raise gradually, never above 15/20.
 
-Pin deployments to `ghcr.io/vitrinadev/linki:v1.7.4-radar.2`; do not use the
+Pin deployments to `ghcr.io/vitrinadev/linki:v1.7.4-radar.5`; do not use the
 upstream `latest` image. Proxy credentials must stay in untracked `0600` env
 files or the deployment secret store and must never appear in logs or health
 checks.
@@ -201,7 +203,7 @@ docker run -d -p 3456:3000 \
   -e NEXTAUTH_SECRET=your_random_secret_here \
   -e AUTH_PASSWORD=your_password_here \
   -v $(pwd)/data:/data \
-  ghcr.io/vitrinadev/linki:v1.7.4-radar.2
+  ghcr.io/vitrinadev/linki:v1.7.4-radar.5
 ```
 
 Linki is now running at `http://localhost:3456`. The SQLite database is persisted in `./data/linki.db` on your host machine.

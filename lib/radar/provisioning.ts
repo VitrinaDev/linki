@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { getDb } from "@/lib/db";
-import type { RadarProvisionInput } from "./contracts";
+import type { RadarControlInput, RadarProvisionInput } from "./contracts";
 
 export class RadarProvisionError extends Error {
   constructor(public readonly statusCode: number, message: string) {
@@ -13,6 +13,16 @@ export interface RadarProvisionResult {
   listId: string;
   workflowId: string;
   created: boolean;
+  outboundEnabled: boolean;
+}
+
+export interface RadarControlResult {
+  enabled: boolean;
+  dailyConnectionLimit: number;
+  dailyMessageLimit: number;
+  pausedRuns: number;
+  resumedRuns: number;
+  retriedTracks: number;
 }
 
 function managedWorkflowHash(input: RadarProvisionInput): string {
@@ -118,6 +128,8 @@ export function provisionRadarCampaign(input: RadarProvisionInput): RadarProvisi
     }
 
     const policy = input.accountPolicy;
+    const effectiveConnectionLimit = input.outboundEnabled ? policy.dailyConnectionLimit : 0;
+    const effectiveMessageLimit = input.outboundEnabled ? policy.dailyMessageLimit : 0;
     db.prepare(`
       UPDATE accounts SET
         daily_connection_limit = ?,
@@ -129,8 +141,8 @@ export function provisionRadarCampaign(input: RadarProvisionInput): RadarProvisi
         working_days = ?
       WHERE id = ?
     `).run(
-      policy.dailyConnectionLimit,
-      policy.dailyMessageLimit,
+      effectiveConnectionLimit,
+      effectiveMessageLimit,
       policy.dailyInmailLimit,
       policy.activeHoursStart,
       policy.activeHoursEnd,
@@ -140,21 +152,105 @@ export function provisionRadarCampaign(input: RadarProvisionInput): RadarProvisi
     );
 
     db.prepare(`
-      INSERT INTO radar_runtime_config (id, list_id, workflow_id, account_id, workflow_sha256, updated_at)
-      VALUES (1, ?, ?, ?, ?, datetime('now'))
+      INSERT INTO radar_runtime_config (id, list_id, workflow_id, account_id, workflow_sha256, outbound_enabled, updated_at)
+      VALUES (1, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(id) DO UPDATE SET
         list_id = excluded.list_id,
         workflow_id = excluded.workflow_id,
         account_id = excluded.account_id,
         workflow_sha256 = excluded.workflow_sha256,
+        outbound_enabled = excluded.outbound_enabled,
         updated_at = excluded.updated_at
-    `).run(input.listId, input.workflowId, accountId, workflowHash);
+    `).run(input.listId, input.workflowId, accountId, workflowHash, input.outboundEnabled ? 1 : 0);
+
+    db.prepare(`
+      UPDATE runs SET status = ?
+      WHERE workflow_id = ? AND list_id = ? AND account_id = ?
+        AND status = ?
+    `).run(
+      input.outboundEnabled ? "running" : "paused",
+      input.workflowId,
+      input.listId,
+      accountId,
+      input.outboundEnabled ? "paused" : "running",
+    );
 
     return {
       accountId,
       listId: input.listId,
       workflowId: input.workflowId,
       created: !previous,
+      outboundEnabled: input.outboundEnabled,
+    };
+  })();
+}
+
+export function controlRadarRuntime(input: RadarControlInput): RadarControlResult {
+  const db = getDb();
+  return db.transaction(() => {
+    const managed = db.prepare(`
+      SELECT list_id, workflow_id, account_id
+      FROM radar_runtime_config WHERE id = 1
+    `).get() as { list_id: string; workflow_id: string; account_id: string } | undefined;
+    if (!managed) throw new RadarProvisionError(409, "Radar campaign has not been provisioned");
+
+    const connectionLimit = input.enabled ? input.dailyConnectionLimit : 0;
+    const messageLimit = input.enabled ? input.dailyMessageLimit : 0;
+    db.prepare(`
+      UPDATE accounts
+      SET daily_connection_limit = ?, daily_message_limit = ?, daily_inmail_limit = 0
+      WHERE id = ?
+    `).run(connectionLimit, messageLimit, managed.account_id);
+    db.prepare(`
+      UPDATE radar_runtime_config
+      SET outbound_enabled = ?, updated_at = datetime('now') WHERE id = 1
+    `).run(input.enabled ? 1 : 0);
+
+    const runChange = db.prepare(`
+      UPDATE runs SET status = ?
+      WHERE workflow_id = ? AND list_id = ? AND account_id = ? AND status = ?
+    `).run(
+      input.enabled ? "running" : "paused",
+      managed.workflow_id,
+      managed.list_id,
+      managed.account_id,
+      input.enabled ? "paused" : "running",
+    );
+
+    let retriedTracks = 0;
+    if (input.enabled && input.retryFailed) {
+      const retried = db.prepare(`
+        UPDATE run_profile_tracks
+        SET state = 'pending', next_step_at = NULL, error_message = NULL
+        WHERE track = 'linkedin' AND state = 'failed'
+          AND run_profile_id IN (
+            SELECT rp.id FROM run_profiles rp
+            JOIN runs r ON r.id = rp.run_id
+            WHERE r.workflow_id = ? AND r.list_id = ? AND r.account_id = ?
+          )
+      `).run(managed.workflow_id, managed.list_id, managed.account_id);
+      retriedTracks = Number(retried.changes);
+      if (retriedTracks > 0) {
+        db.prepare(`
+          UPDATE runs SET status = 'running', completed_at = NULL,
+            started_at = COALESCE(started_at, datetime('now'))
+          WHERE workflow_id = ? AND list_id = ? AND account_id = ?
+            AND EXISTS (
+              SELECT 1 FROM run_profiles rp
+              JOIN run_profile_tracks rt ON rt.run_profile_id = rp.id
+              WHERE rp.run_id = runs.id AND rt.track = 'linkedin' AND rt.state = 'pending'
+            )
+        `).run(managed.workflow_id, managed.list_id, managed.account_id);
+      }
+    }
+
+    return {
+      enabled: input.enabled,
+      dailyConnectionLimit: input.dailyConnectionLimit,
+      dailyMessageLimit: input.dailyMessageLimit,
+      pausedRuns: input.enabled ? 0 : Number(runChange.changes),
+      resumedRuns: input.enabled ? Number(runChange.changes) : 0,
+      retriedTracks,
     };
   })();
 }

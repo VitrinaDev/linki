@@ -14,12 +14,14 @@ delete process.env.RADAR_WORKFLOW_ID;
 type Db = ReturnType<typeof import("../lib/db")["getDb"]>;
 let db: Db;
 let provisionRadarCampaign: typeof import("../lib/radar/provisioning")["provisionRadarCampaign"];
+let controlRadarRuntime: typeof import("../lib/radar/provisioning")["controlRadarRuntime"];
 let getRadarConfig: typeof import("../lib/radar/config")["getRadarConfig"];
 let getRadarRuntimeStatus: typeof import("../lib/radar/runtime")["getRadarRuntimeStatus"];
 let upsertRadarAccount: typeof import("../lib/radar/runtime")["upsertRadarAccount"];
 
 const manifest = {
   schemaVersion: 1 as const,
+  outboundEnabled: false,
   listId: "radar_vitrina_active_campaign" as const,
   workflowId: "radar_vitrina_active_campaign_workflow" as const,
   campaignName: "Radar · Vitrina active",
@@ -43,6 +45,7 @@ before(async () => {
   const runtimeModule = await import("../lib/radar/runtime");
   db = dbModule.getDb();
   provisionRadarCampaign = provisioningModule.provisionRadarCampaign;
+  controlRadarRuntime = provisioningModule.controlRadarRuntime;
   getRadarConfig = configModule.getRadarConfig;
   getRadarRuntimeStatus = runtimeModule.getRadarRuntimeStatus;
   upsertRadarAccount = runtimeModule.upsertRadarAccount;
@@ -80,8 +83,8 @@ test("provisions the managed list, workflow, binding, and conservative account p
       FROM accounts WHERE id = 'founder-1'
   `).get();
   assert.deepEqual(account, {
-    daily_connection_limit: 1,
-    daily_message_limit: 1,
+    daily_connection_limit: 0,
+    daily_message_limit: 0,
     daily_inmail_limit: 0,
     active_hours_start: 9,
     active_hours_end: 18,
@@ -90,11 +93,60 @@ test("provisions the managed list, workflow, binding, and conservative account p
   });
 });
 
+test("enforces a hard runtime pause and can explicitly retry failed managed tracks", () => {
+  db.prepare("INSERT INTO targets (id, linkedin_url) VALUES ('target-1', 'https://www.linkedin.com/in/target-1')").run();
+  db.prepare(`
+    INSERT INTO runs (id, workflow_id, list_id, account_id, status)
+    VALUES ('run-1', ?, ?, 'founder-1', 'paused')
+  `).run(manifest.workflowId, manifest.listId);
+  db.prepare("INSERT INTO run_profiles (id, run_id, target_id) VALUES ('profile-1', 'run-1', 'target-1')").run();
+  db.prepare(`
+    INSERT INTO run_profile_tracks (id, run_profile_id, track, state, error_message)
+    VALUES ('track-1', 'profile-1', 'linkedin', 'failed', 'temporary failure')
+  `).run();
+
+  const enabled = controlRadarRuntime({
+    enabled: true,
+    dailyConnectionLimit: 2,
+    dailyMessageLimit: 3,
+    retryFailed: true,
+  });
+  assert.deepEqual(enabled, {
+    enabled: true,
+    dailyConnectionLimit: 2,
+    dailyMessageLimit: 3,
+    pausedRuns: 0,
+    resumedRuns: 1,
+    retriedTracks: 1,
+  });
+  assert.deepEqual(db.prepare("SELECT status FROM runs WHERE id = 'run-1'").get(), { status: "running" });
+  assert.deepEqual(
+    db.prepare("SELECT state, error_message FROM run_profile_tracks WHERE id = 'track-1'").get(),
+    { state: "pending", error_message: null },
+  );
+
+  const paused = controlRadarRuntime({
+    enabled: false,
+    dailyConnectionLimit: 2,
+    dailyMessageLimit: 3,
+    retryFailed: false,
+  });
+  assert.equal(paused.pausedRuns, 1);
+  assert.deepEqual(
+    db.prepare("SELECT daily_connection_limit, daily_message_limit FROM accounts WHERE id = 'founder-1'").get(),
+    { daily_connection_limit: 0, daily_message_limit: 0 },
+  );
+  assert.deepEqual(db.prepare("SELECT outbound_enabled FROM radar_runtime_config WHERE id = 1").get(), { outbound_enabled: 0 });
+  db.prepare("DELETE FROM runs WHERE id = 'run-1'").run();
+  db.prepare("DELETE FROM targets WHERE id = 'target-1'").run();
+});
+
 test("reports a secret-free runtime status and preserves authentication on metadata updates", () => {
   const before = getRadarRuntimeStatus();
   assert.equal(before.proxyConfigured, false);
   assert.equal(before.accountCount, 1);
   assert.equal(before.campaign?.workflow_id, manifest.workflowId);
+  assert.equal(before.campaign?.outbound_enabled, 0);
   assert.deepEqual(before.queue, { contacts: 0, pending: 0, inProgress: 0, completed: 0, failed: 0 });
   assert.equal("cookies_json" in before.account!, false);
 

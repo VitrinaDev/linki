@@ -1,6 +1,6 @@
 services:
   linki:
-    image: ghcr.io/vitrinadev/linki:v1.7.4-radar.2
+    image: ghcr.io/vitrinadev/linki:v1.7.4-radar.5
     # To build from source instead: comment out image above and uncomment below
     # build: .
     ports:

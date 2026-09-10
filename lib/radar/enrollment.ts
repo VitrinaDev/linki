@@ -33,6 +33,12 @@ export function enrollRadarContact(
   const radarLeadId = input.customAttributes.radar_lead_id;
 
   const result = db.transaction((): RadarEnrollmentResult => {
+    const runtimeControl = db.prepare(
+      "SELECT outbound_enabled FROM radar_runtime_config WHERE id = 1",
+    ).get() as { outbound_enabled: number } | undefined;
+    if (runtimeControl && runtimeControl.outbound_enabled !== 1) {
+      throw new RadarEnrollmentError(423, "Radar LinkedIn runtime is paused");
+    }
     const account = db.prepare("SELECT id FROM accounts WHERE id = ?").get(config.accountId) as
       | { id: string }
       | undefined;

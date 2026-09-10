@@ -45,7 +45,7 @@ export function getRadarRuntimeStatus() {
   const db = getDb();
   const accounts = db.prepare(`SELECT ${ACCOUNT_COLUMNS} FROM accounts ORDER BY created_at`).all() as Array<Record<string, unknown>>;
   const managed = db.prepare(`
-    SELECT rc.list_id, rc.workflow_id, rc.account_id, rc.updated_at,
+    SELECT rc.list_id, rc.workflow_id, rc.account_id, rc.outbound_enabled, rc.updated_at,
            l.name AS list_name, w.name AS workflow_name
       FROM radar_runtime_config rc
       JOIN lists l ON l.id = rc.list_id

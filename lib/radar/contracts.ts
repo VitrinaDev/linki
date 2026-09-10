@@ -37,6 +37,7 @@ const validTimeZone = (value: string) => {
 
 export const radarProvisionSchema = z.object({
   schemaVersion: z.literal(1),
+  outboundEnabled: z.boolean(),
   listId: z.literal(DEFAULT_RADAR_LIST_ID),
   workflowId: z.literal(DEFAULT_RADAR_WORKFLOW_ID),
   campaignName: z.string().trim().min(1).max(200),
@@ -60,6 +61,15 @@ export const radarProvisionSchema = z.object({
 }).strict();
 
 export type RadarProvisionInput = z.infer<typeof radarProvisionSchema>;
+
+export const radarControlSchema = z.object({
+  enabled: z.boolean(),
+  dailyConnectionLimit: z.number().int().min(0).max(15),
+  dailyMessageLimit: z.number().int().min(0).max(20),
+  retryFailed: z.boolean().optional().default(false),
+}).strict();
+
+export type RadarControlInput = z.infer<typeof radarControlSchema>;
 
 export const radarAccountSchema = z.object({
   name: z.string().trim().min(1).max(200),

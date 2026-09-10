@@ -506,8 +506,10 @@ function runMigrations(db: Database.Database) {
       workflow_id TEXT NOT NULL REFERENCES workflows(id),
       account_id TEXT NOT NULL REFERENCES accounts(id),
       workflow_sha256 TEXT NOT NULL,
+      outbound_enabled INTEGER NOT NULL DEFAULT 0 CHECK(outbound_enabled IN (0, 1)),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`,
+    "ALTER TABLE radar_runtime_config ADD COLUMN outbound_enabled INTEGER NOT NULL DEFAULT 0 CHECK(outbound_enabled IN (0, 1))",
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }
