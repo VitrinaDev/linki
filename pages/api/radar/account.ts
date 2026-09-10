@@ -4,13 +4,19 @@ import { radarAccountSchema } from "@/lib/radar/contracts";
 import { RadarProvisionError } from "@/lib/radar/provisioning";
 import { upsertRadarAccount } from "@/lib/radar/runtime";
 
-export default function handler(req: NextApiRequest, res: NextApiResponse) {
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "PUT") {
     res.setHeader("Allow", "PUT");
     return res.status(405).json({ error: "Method not allowed" });
   }
   try {
-    return res.status(200).json(upsertRadarAccount(radarAccountSchema.parse(req.body)));
+    const account = upsertRadarAccount(radarAccountSchema.parse(req.body)) as { id: string };
+    // Metadata changes are rare and must take effect on the very next task.
+    // In particular, changing the email clears stored cookies; keeping an old
+    // in-memory browser context would otherwise continue as the previous user.
+    const { closeSession } = await import("@/lib/linkedin/session");
+    await closeSession(account.id);
+    return res.status(200).json(account);
   } catch (error) {
     if (error instanceof ZodError) {
       return res.status(400).json({ error: "Invalid LinkedIn account", issues: error.issues });
