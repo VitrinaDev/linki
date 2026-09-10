@@ -200,7 +200,7 @@ docker run -d -p 3456:3000 \
   -e NEXTAUTH_SECRET=your_random_secret_here \
   -e AUTH_PASSWORD=your_password_here \
   -v $(pwd)/data:/data \
-  moaljumaa/linki:latest
+  ghcr.io/vitrinadev/linki:v1.7.4-radar.1
 ```
 
 Linki is now running at `http://localhost:3456`. The SQLite database is persisted in `./data/linki.db` on your host machine.
