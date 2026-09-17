@@ -214,6 +214,47 @@ function dropDeprecatedRunProfileColumns(db: Database.Database) {
   } catch { /* ignore — may already be done */ }
 }
 
+/**
+ * Databases provisioned before profile reads have radar_callback_outbox with
+ * `target_id NOT NULL`, `payload_json NOT NULL` and a two-value event_type
+ * CHECK. A profile-read event has no target, and its payload is nulled once
+ * delivered, so the table is rebuilt (same pattern as the workflow_steps and
+ * targets rebuilds below) preserving every row. Nothing is dropped.
+ */
+function migrateRadarCallbackOutbox(db: Database.Database) {
+  try {
+    const ti = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='radar_callback_outbox'",
+    ).get() as { sql: string } | undefined;
+    if (!ti || ti.sql.includes("'profile.read'")) return;
+    db.exec(`
+      PRAGMA foreign_keys = OFF;
+      CREATE TABLE radar_callback_outbox_new (
+        event_id TEXT PRIMARY KEY,
+        target_id TEXT REFERENCES targets(id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL CHECK(event_type IN ('connection.accepted', 'message.replied', 'profile.read', 'profile.read.failed')),
+        occurred_at TEXT NOT NULL,
+        payload_json TEXT,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sending', 'sent')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
+        locked_at TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        sent_at TEXT
+      );
+      INSERT INTO radar_callback_outbox_new
+        SELECT event_id, target_id, event_type, occurred_at, payload_json, status,
+               attempts, next_attempt_at, locked_at, last_error, created_at, sent_at
+          FROM radar_callback_outbox;
+      DROP TABLE radar_callback_outbox;
+      ALTER TABLE radar_callback_outbox_new RENAME TO radar_callback_outbox;
+      CREATE INDEX IF NOT EXISTS idx_radar_callback_due ON radar_callback_outbox(status, next_attempt_at);
+      PRAGMA foreign_keys = ON;
+    `);
+  } catch { /* migration already done */ }
+}
+
 function runMigrations(db: Database.Database) {
   // Add columns introduced after initial schema — safe to run on existing DBs
   const migrations = [
@@ -483,12 +524,16 @@ function runMigrations(db: Database.Database) {
     "CREATE INDEX IF NOT EXISTS idx_targets_radar_status ON targets(radar_status) WHERE radar_lead_id IS NOT NULL",
     // Transactional callback outbox. Delivery is retried independently of the
     // LinkedIn polling cycle, so a Radar outage cannot lose accept/reply events.
+    // target_id is nullable and payload_json is redactable because profile-read
+    // events (profile.read / profile.read.failed) belong to a Radar Persona, not
+    // to a Linki target — a read never creates one. Existing databases are
+    // rebuilt into this shape by migrateRadarCallbackOutbox() below.
     `CREATE TABLE IF NOT EXISTS radar_callback_outbox (
       event_id TEXT PRIMARY KEY,
-      target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
-      event_type TEXT NOT NULL CHECK(event_type IN ('connection.accepted', 'message.replied')),
+      target_id TEXT REFERENCES targets(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL CHECK(event_type IN ('connection.accepted', 'message.replied', 'profile.read', 'profile.read.failed')),
       occurred_at TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
+      payload_json TEXT,
       status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sending', 'sent')),
       attempts INTEGER NOT NULL DEFAULT 0,
       next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -510,11 +555,42 @@ function runMigrations(db: Database.Database) {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`,
     "ALTER TABLE radar_runtime_config ADD COLUMN outbound_enabled INTEGER NOT NULL DEFAULT 0 CHECK(outbound_enabled IN (0, 1))",
+    // Profile reads: a switch and a budget of their OWN, deliberately separate
+    // from outbound_enabled and from the connection/message limits. Reading is
+    // not outreach, so one can be on while the other is off — and both default
+    // to off/zero, because turning either on is an explicit owner decision.
+    "ALTER TABLE radar_runtime_config ADD COLUMN reads_enabled INTEGER NOT NULL DEFAULT 0 CHECK(reads_enabled IN (0, 1))",
+    "ALTER TABLE radar_runtime_config ADD COLUMN daily_profile_read_limit INTEGER NOT NULL DEFAULT 0 CHECK(daily_profile_read_limit BETWEEN 0 AND 25)",
+    "ALTER TABLE radar_runtime_config ADD COLUMN min_read_gap_minutes INTEGER NOT NULL DEFAULT 3 CHECK(min_read_gap_minutes BETWEEN 3 AND 30)",
+    // Durable profile-read jobs. This row IS the whole local footprint of a
+    // read: the sanitised result is written only to the callback outbox and is
+    // redacted from it once delivered. No target, run or track is ever created.
+    `CREATE TABLE IF NOT EXISTS radar_profile_reads (
+      id TEXT PRIMARY KEY,
+      radar_persona_id TEXT NOT NULL,
+      linkedin_url TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'queued' CHECK(state IN ('queued', 'running', 'done', 'failed')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      scheduled_at TEXT NOT NULL DEFAULT (datetime('now')),
+      locked_at TEXT,
+      completed_at TEXT,
+      error_code TEXT,
+      read_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`,
+    // One open job per Persona — the endpoint answers 409 with the open job id
+    // instead of queueing a second visit to the same profile.
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_radar_profile_reads_open
+       ON radar_profile_reads(radar_persona_id) WHERE state IN ('queued', 'running')`,
+    "CREATE INDEX IF NOT EXISTS idx_radar_profile_reads_due ON radar_profile_reads(state, scheduled_at)",
+    "CREATE INDEX IF NOT EXISTS idx_radar_profile_reads_completed ON radar_profile_reads(completed_at)",
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }
   }
 
+  // Radar callback outbox: widen event_type and free target_id/payload_json.
+  migrateRadarCallbackOutbox(db);
   // Parallel tracks: assign email steps to email track, re-number step_order, backfill run_profile_tracks
   runParallelTracksMigration(db);
   // Drop deprecated run_profiles columns (state, current_step, etc.) — consumers now read track-runs

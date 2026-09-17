@@ -36,6 +36,11 @@ const manifest = {
     timezone: "America/Santiago",
     workingDays: [1, 2, 3, 4, 5],
   },
+  readPolicy: {
+    enabled: false,
+    dailyProfileReadLimit: 0,
+    minGapMinutes: 3,
+  },
 };
 
 before(async () => {

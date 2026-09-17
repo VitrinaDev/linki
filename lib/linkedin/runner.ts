@@ -1,12 +1,20 @@
 import { getDb } from "@/lib/db";
 import { randomUUID } from "crypto";
 import { getSessionPage, saveSessionState, getSessionContext } from "@/lib/linkedin/session";
+import {
+  getLocalParts,
+  isWithinSchedule,
+  nextScheduledSlot,
+  rescheduleToTomorrow,
+  type ScheduleConfig,
+} from "@/lib/linkedin/schedule";
 import { visitProfile } from "@/lib/linkedin/visit";
 import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError } from "@/lib/linkedin/connect";
 import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
 import { shouldSyncAccepted, syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
 import { shouldSyncRadarInbox, syncRadarInbox } from "@/lib/linkedin/sync-radar-replies";
 import { processRadarCallbacks } from "@/lib/radar/callbacks";
+import { processProfileReads } from "@/lib/radar/profile-reads";
 import { getOptionalRadarConfig } from "@/lib/radar/config";
 import type { RadarStatus } from "@/lib/radar/contracts";
 import { sendEmail } from "@/lib/email/sender";
@@ -42,13 +50,6 @@ const PROFILE_DELAY_MAX = 20;
 // Poll interval (ms)
 const POLL_INTERVAL_MS = 30_000;
 
-interface ScheduleConfig {
-  active_hours_start: number;
-  active_hours_end: number;
-  timezone: string;
-  working_days: string;
-}
-
 interface AccountLimits extends ScheduleConfig {
   daily_connection_limit: number;
   daily_message_limit: number;
@@ -66,61 +67,6 @@ function effectiveEmailLimit(account: EmailAccountLimits): number {
   const daysActive = Math.max(1, Math.floor((Date.now() - new Date(account.ramp_start_date).getTime()) / 86_400_000) + 1);
   const ramped = daysActive * 2;
   return Math.min(account.daily_email_limit, ramped);
-}
-
-function getLocalParts(tz: string, date = new Date()): { hour: number; minute: number; isoWeekday: number } {
-  const safeZone = (() => { try { Intl.DateTimeFormat(undefined, { timeZone: tz }); return tz; } catch { return "UTC"; } })();
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: safeZone,
-    hour: "numeric", minute: "numeric", weekday: "short", hour12: false,
-  }).formatToParts(date);
-  const get = (t: string) => parts.find(p => p.type === t)?.value ?? "";
-  const hour = parseInt(get("hour"), 10) % 24;
-  const minute = parseInt(get("minute"), 10);
-  const weekdayMap: Record<string, number> = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
-  return { hour, minute, isoWeekday: weekdayMap[get("weekday")] ?? 1 };
-}
-
-function isWithinSchedule(account: ScheduleConfig): boolean {
-  const { hour, minute, isoWeekday } = getLocalParts(account.timezone || "UTC");
-  const allowedDays = (account.working_days || "1,2,3,4,5").split(",").map(Number);
-  if (!allowedDays.includes(isoWeekday)) return false;
-  const frac = hour + minute / 60;
-  return frac >= (account.active_hours_start ?? 9) && frac < (account.active_hours_end ?? 18);
-}
-
-function randomSlotInActiveWindow(account: ScheduleConfig, targetDate?: Date): string {
-  const start = account.active_hours_start ?? 9;
-  const end = account.active_hours_end ?? 18;
-  const base = targetDate ? new Date(targetDate) : new Date();
-  const startMs = new Date(base.getFullYear(), base.getMonth(), base.getDate(), start, 0, 0).getTime();
-  const endMs   = new Date(base.getFullYear(), base.getMonth(), base.getDate(), end,   0, 0).getTime();
-  return new Date(startMs + Math.random() * (endMs - startMs)).toISOString();
-}
-
-function rescheduleToTomorrow(account: ScheduleConfig): string {
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  return randomSlotInActiveWindow(account, tomorrow);
-}
-
-function nextScheduledSlot(account: ScheduleConfig): string {
-  const tz = account.timezone || "UTC";
-  const allowedDays = (account.working_days || "1,2,3,4,5").split(",").map(Number);
-  const end = account.active_hours_end ?? 18;
-  const { hour: nowHour, minute: nowMin, isoWeekday: nowDay } = getLocalParts(tz);
-  const nowFrac = nowHour + nowMin / 60;
-  if (allowedDays.includes(nowDay) && nowFrac < end - 0.25) {
-    const remaining = (end - nowFrac) * 3600_000;
-    return new Date(Date.now() + Math.random() * remaining).toISOString();
-  }
-  const candidate = new Date();
-  for (let i = 1; i <= 14; i++) {
-    candidate.setDate(candidate.getDate() + 1);
-    const { isoWeekday } = getLocalParts(tz, candidate);
-    if (allowedDays.includes(isoWeekday)) return randomSlotInActiveWindow(account, candidate);
-  }
-  return new Date(Date.now() + 86_400_000).toISOString();
 }
 
 interface WorkflowStep {
@@ -969,6 +915,13 @@ async function globalLoop(): Promise<void> {
       } catch (err) {
         console.error("[radar] Inbox sync error:", err instanceof Error ? err.message : err);
       }
+    }
+    // Profile reads run BEFORE tick() and outside it: they belong to no run, so
+    // they must keep working while every campaign run is paused. One per turn.
+    try {
+      await processProfileReads(db);
+    } catch (err) {
+      console.error("[radar] Profile read error:", err instanceof Error ? err.message : err);
     }
     try {
       await tick(db);

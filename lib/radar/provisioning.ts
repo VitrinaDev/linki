@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { getDb } from "@/lib/db";
-import type { RadarControlInput, RadarProvisionInput } from "./contracts";
+import { DISABLED_READ_POLICY, type RadarControlInput, type RadarProvisionInput, type RadarReadPolicy } from "./contracts";
 
 export class RadarProvisionError extends Error {
   constructor(public readonly statusCode: number, message: string) {
@@ -14,6 +14,8 @@ export interface RadarProvisionResult {
   workflowId: string;
   created: boolean;
   outboundEnabled: boolean;
+  readsEnabled: boolean;
+  dailyProfileReadLimit: number;
 }
 
 export interface RadarControlResult {
@@ -25,6 +27,11 @@ export interface RadarControlResult {
   retriedTracks: number;
 }
 
+/**
+ * Identity of the managed workflow STEPS. `accountPolicy` and `readPolicy` are
+ * deliberately excluded: changing a limit or a read budget must not rewrite the
+ * steps, and must not be refused by the "contacts are active" guard below.
+ */
 function managedWorkflowHash(input: RadarProvisionInput): string {
   return createHash("sha256").update(JSON.stringify({
     schemaVersion: input.schemaVersion,
@@ -34,6 +41,15 @@ function managedWorkflowHash(input: RadarProvisionInput): string {
     messageTemplate: input.messageTemplate,
     messageDelaySeconds: input.messageDelaySeconds,
   })).digest("hex");
+}
+
+/**
+ * A Radar that predates profile reads sends no `readPolicy` at all. The schema
+ * defaults it to "disabled", and this guard repeats that for any direct caller:
+ * absence means no reads, never "leave whatever was configured".
+ */
+function effectiveReadPolicy(input: RadarProvisionInput): RadarReadPolicy {
+  return input.readPolicy ?? DISABLED_READ_POLICY;
 }
 
 function resolveSingleAuthenticatedAccount(): string {
@@ -61,6 +77,12 @@ function resolveSingleAuthenticatedAccount(): string {
   return accounts[0].id;
 }
 
+/**
+ * Gate for BOTH switches. Reads are not outreach, but they are still real
+ * activity on a real account, so they need the same readiness: an
+ * authenticated session, the required static proxy, and a callback destination
+ * (a read whose result cannot be delivered is a read taken for nothing).
+ */
 function assertRuntimeCanEnable(accountId: string): void {
   const db = getDb();
   const account = db.prepare(
@@ -82,7 +104,8 @@ function assertRuntimeCanEnable(accountId: string): void {
 export function provisionRadarCampaign(input: RadarProvisionInput): RadarProvisionResult {
   const db = getDb();
   const accountId = resolveSingleAuthenticatedAccount();
-  if (input.outboundEnabled) assertRuntimeCanEnable(accountId);
+  const readPolicy = effectiveReadPolicy(input);
+  if (input.outboundEnabled || readPolicy.enabled) assertRuntimeCanEnable(accountId);
   const workflowHash = managedWorkflowHash(input);
 
   return db.transaction(() => {
@@ -170,17 +193,33 @@ export function provisionRadarCampaign(input: RadarProvisionInput): RadarProvisi
       accountId,
     );
 
+    const effectiveReadLimit = readPolicy.enabled ? readPolicy.dailyProfileReadLimit : 0;
     db.prepare(`
-      INSERT INTO radar_runtime_config (id, list_id, workflow_id, account_id, workflow_sha256, outbound_enabled, updated_at)
-      VALUES (1, ?, ?, ?, ?, ?, datetime('now'))
+      INSERT INTO radar_runtime_config (
+        id, list_id, workflow_id, account_id, workflow_sha256, outbound_enabled,
+        reads_enabled, daily_profile_read_limit, min_read_gap_minutes, updated_at
+      )
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(id) DO UPDATE SET
         list_id = excluded.list_id,
         workflow_id = excluded.workflow_id,
         account_id = excluded.account_id,
         workflow_sha256 = excluded.workflow_sha256,
         outbound_enabled = excluded.outbound_enabled,
+        reads_enabled = excluded.reads_enabled,
+        daily_profile_read_limit = excluded.daily_profile_read_limit,
+        min_read_gap_minutes = excluded.min_read_gap_minutes,
         updated_at = excluded.updated_at
-    `).run(input.listId, input.workflowId, accountId, workflowHash, input.outboundEnabled ? 1 : 0);
+    `).run(
+      input.listId,
+      input.workflowId,
+      accountId,
+      workflowHash,
+      input.outboundEnabled ? 1 : 0,
+      readPolicy.enabled ? 1 : 0,
+      effectiveReadLimit,
+      readPolicy.minGapMinutes,
+    );
 
     db.prepare(`
       UPDATE runs SET status = ?
@@ -200,6 +239,8 @@ export function provisionRadarCampaign(input: RadarProvisionInput): RadarProvisi
       workflowId: input.workflowId,
       created: !previous,
       outboundEnabled: input.outboundEnabled,
+      readsEnabled: readPolicy.enabled,
+      dailyProfileReadLimit: effectiveReadLimit,
     };
   })();
 }

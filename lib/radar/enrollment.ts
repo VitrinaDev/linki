@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { getDb } from "@/lib/db";
 import { ensureGlobalRunnerStarted } from "@/lib/linkedin/runner";
-import type { RadarContactInput } from "./contracts";
+import { canonicalLinkedInUrl, type RadarContactInput } from "./contracts";
 import type { RadarConfig } from "./config";
 
 export class RadarEnrollmentError extends Error {
@@ -14,14 +14,6 @@ export interface RadarEnrollmentResult {
   id: string;
   status: "QUEUED";
   alreadyExists: boolean;
-}
-
-function canonicalLinkedInUrl(raw: string): string {
-  const url = new URL(raw);
-  url.hash = "";
-  url.search = "";
-  url.pathname = url.pathname.replace(/\/+$/, "");
-  return url.toString().replace(/\/$/, "");
 }
 
 export function enrollRadarContact(

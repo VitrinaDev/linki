@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
-import { buildRadarCallback, callbackSignature, retryDelaySeconds, type RadarCallbackEventType } from "./contracts";
+import {
+  buildRadarCallback,
+  callbackSignature,
+  REDACTED_CALLBACK_EVENT_TYPES,
+  retryDelaySeconds,
+  type RadarCallbackEventType,
+  type RadarContactEventType,
+} from "./contracts";
 import { getOptionalRadarConfig, getRadarCallbackConfig } from "./config";
 
 interface RadarEventSource {
@@ -12,6 +19,7 @@ interface RadarEventSource {
 
 interface OutboxRow {
   event_id: string;
+  event_type: RadarCallbackEventType;
   payload_json: string;
   attempts: number;
 }
@@ -23,7 +31,7 @@ function iso(value: string): string {
   return new Date(hasZone ? value : `${value.replace(" ", "T")}Z`).toISOString();
 }
 
-function eventId(targetId: string, eventType: RadarCallbackEventType, occurredAt: string): string {
+function eventId(targetId: string, eventType: RadarContactEventType, occurredAt: string): string {
   const digest = createHash("sha256").update(`${targetId}:${eventType}:${occurredAt}`).digest("hex").slice(0, 32);
   return `linki_${digest}`;
 }
@@ -44,7 +52,7 @@ export function harvestRadarCallbacks(db: Database.Database): number {
 
   db.transaction(() => {
     for (const source of sources) {
-      const candidates: Array<[RadarCallbackEventType, string | null]> = [
+      const candidates: Array<[RadarContactEventType, string | null]> = [
         ["connection.accepted", source.connected_at],
         ["message.replied", source.last_replied_at],
       ];
@@ -73,9 +81,10 @@ function claimDueRows(db: Database.Database): OutboxRow[] {
       WHERE status = 'sending' AND locked_at < datetime('now', '-5 minutes')
     `).run();
     const rows = db.prepare(`
-      SELECT event_id, payload_json, attempts
+      SELECT event_id, event_type, payload_json, attempts
       FROM radar_callback_outbox
-      WHERE status = 'pending' AND datetime(next_attempt_at) <= datetime('now')
+      WHERE status = 'pending' AND payload_json IS NOT NULL
+        AND datetime(next_attempt_at) <= datetime('now')
       ORDER BY created_at ASC LIMIT 20
     `).all() as OutboxRow[];
     const claim = db.prepare(`
@@ -114,12 +123,17 @@ export async function processRadarCallbacks(db: Database.Database): Promise<void
         signal: AbortSignal.timeout(15_000),
       });
       if (!response.ok) throw new Error(`Radar callback returned HTTP ${response.status}`);
+      // Profile-read payloads carry personal data that Radar, not Linki, is the
+      // system of record for. Once delivered, the local copy is dropped: the row
+      // survives as proof of delivery, its body does not.
+      const redact = REDACTED_CALLBACK_EVENT_TYPES.includes(row.event_type);
       db.prepare(`
         UPDATE radar_callback_outbox
         SET status = 'sent', attempts = attempts + 1, sent_at = datetime('now'),
-            locked_at = NULL, last_error = NULL
+            locked_at = NULL, last_error = NULL,
+            payload_json = CASE WHEN ? THEN NULL ELSE payload_json END
         WHERE event_id = ?
-      `).run(row.event_id);
+      `).run(redact ? 1 : 0, row.event_id);
     } catch (error) {
       const attempts = row.attempts + 1;
       const nextAttemptAt = new Date(Date.now() + retryDelaySeconds(attempts) * 1000).toISOString();

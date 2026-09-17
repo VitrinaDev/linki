@@ -21,11 +21,12 @@
 
 This fork is the owned LinkedIn execution layer for Radar. It adds the exact
 `POST /api/contacts` and `PATCH /api/contacts/by-radar-lead-id/:id` contracts,
-durable signed callbacks for connection accepts and replies, the
-`{{icebreaker_context}}` template variable, and process-wide static proxy
-enforcement. Radar owns account setup, authentication, runtime health, limits,
-and the managed list/workflow through `/api/radar/*`; operators do not need the
-Linki UI. The routes use the existing `x-internal-secret` authentication.
+`POST /api/radar/profiles/read` for profile reads, durable signed callbacks for
+connection accepts, replies and reads, the `{{icebreaker_context}}` template
+variable, and process-wide static proxy enforcement. Radar owns account setup,
+authentication, runtime health, limits, and the managed list/workflow through
+`/api/radar/*`; operators do not need the Linki UI. The routes use the existing
+`x-internal-secret` authentication.
 
 ### Four-founder deployment rules
 
@@ -55,6 +56,7 @@ RADAR_CALLBACK_URL=https://radar.vitrinadev.com/api/webhooks/v1/omnichannel-call
 RADAR_CALLBACK_SECRET=<same value as Radar OMNICHANNEL_WEBHOOK_SECRET>
 RADAR_ACCEPTED_SYNC_INTERVAL_MINUTES=5
 RADAR_REPLY_SYNC_INTERVAL_MINUTES=15
+RADAR_RUNTIME_KEY=<short non-secret name of this runtime, e.g. the founder's>
 ```
 
 Authenticate from Radar's `/linkedin` screen only after the runtime proxy is
@@ -68,7 +70,41 @@ account to zero sends while paused, changes limits, and can retry failed tracks.
 Start with 1 connection/day and 1 message/day and `enabled:false`; after a
 controlled test, opt in and raise gradually, never above 15/20.
 
-Pin deployments to `ghcr.io/vitrinadev/linki:v1.7.4-radar.7`; do not use the
+### Profile reads
+
+`POST /api/radar/profiles/read` takes `{ linkedinUrl, radar_persona_id }` and
+queues one durable job:
+
+```
+201 { "jobId": "<uuid>", "status": "QUEUED", "scheduledAt": "<iso>" }
+409 { "jobId": "<uuid>", "duplicated": true }        // a job is already open for that Persona
+423 { "error": "Profile reads are disabled on this runtime" }
+429 { "error": "Daily read cap reached", "retryAfter": <seconds> }
+```
+
+A read is not outreach and has its own switch, sent in the provision manifest as
+`readPolicy: { enabled, dailyProfileReadLimit (0-25), minGapMinutes (3-30) }`.
+Reads may run while sending stays off — they are separate decisions — but both
+need the same readiness: an authenticated account, the required proxy and a
+callback destination. A Radar that does not send `readPolicy` still provisions,
+with reads disabled. Changing the read budget never rewrites the managed
+workflow, so it is accepted while contacts are in flight.
+
+Jobs execute one at a time inside the existing session and page queue, only
+within the account's working hours, spaced by `minGapMinutes` plus jitter. The
+result travels back as a `profile.read` callback — the same envelope, signature
+and outbox as the other events — carrying exactly `linkedin_url`, `headline`,
+`location`, `partial`, `positions[{title, company, company_url, start, end,
+current}]` and `read_at`, and nothing else. A failure sends `profile.read.failed`
+with its `error_code`. Linki stores only the job row: the payload lives in the
+outbox and is deleted from it on delivery. No contact, run or track is ever
+created by a read. A challenge, checkpoint, login redirect, HTTP 429 or
+restriction page turns reads AND sending off for the whole runtime and fails the
+job without retrying; only a network timeout is retried, once, 30 minutes later.
+`GET /api/radar/status` reports `reads: { enabled, dailyLimit, usedToday,
+lastReadAt }`. Both switches ship off: turning them on is an explicit decision.
+
+Pin deployments to `ghcr.io/vitrinadev/linki:v1.7.4-radar.8`; do not use the
 upstream `latest` image. Proxy credentials must stay in untracked `0600` env
 files or the deployment secret store and must never appear in logs or health
 checks.
@@ -203,7 +239,7 @@ docker run -d -p 3456:3000 \
   -e NEXTAUTH_SECRET=your_random_secret_here \
   -e AUTH_PASSWORD=your_password_here \
   -v $(pwd)/data:/data \
-  ghcr.io/vitrinadev/linki:v1.7.4-radar.7
+  ghcr.io/vitrinadev/linki:v1.7.4-radar.8
 ```
 
 Linki is now running at `http://localhost:3456`. The SQLite database is persisted in `./data/linki.db` on your host machine.
