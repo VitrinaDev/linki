@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { getDb } from "@/lib/db";
 import type { RadarAccountInput } from "./contracts";
+import { readRuntimePause } from "./pause";
 import { getProfileReadStatus } from "./profile-reads";
 import { RadarProvisionError } from "./provisioning";
 
@@ -87,7 +88,12 @@ export function getRadarRuntimeStatus() {
     queue,
     // Profile reads: a budget of their own, reported separately from the
     // campaign queue because they are not outreach and do not enrol anyone.
+    // `usedToday` counts LinkedIn navigations, which is what the cap spends.
     reads: getProfileReadStatus(db),
+    // Durable pause after a LinkedIn incident. While this is non-null nothing
+    // can be enabled — sending, reads or resuming a run — until an operator
+    // acknowledges it through PUT /api/radar/control.
+    pause: readRuntimePause(db),
     proxyConfigured: process.env.LINKI_REQUIRE_PROXY === "true"
       && Boolean(process.env.LINKI_PROXY_SERVER?.trim()),
     callbackConfigured: Boolean(

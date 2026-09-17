@@ -4,7 +4,9 @@
  * A read is NOT outreach and must never behave like it. It therefore:
  *  - has its own switch (`radar_runtime_config.reads_enabled`) and its own
  *    budget (`daily_profile_read_limit`, `min_read_gap_minutes`), independent
- *    of `outbound_enabled` and of the connection/message limits;
+ *    of `outbound_enabled` and of the connection/message limits. The budget is
+ *    spent in NAVIGATIONS: the reader asks before every page it opens, and the
+ *    fallback chain stops rather than exceed the day's cap;
  *  - never passes through lib/radar/enrollment.ts, so it never meets the 423
  *    outbound gate and never creates a `target`, a `run` or a
  *    `run_profile_track`;
@@ -18,11 +20,14 @@
  * sanitised result is written only to `radar_callback_outbox.payload_json`, and
  * that column is nulled the moment the callback is delivered.
  *
- * Fail closed: a challenge, checkpoint, login redirect, HTTP 429 or a
- * restriction page pauses reads AND outbound sending for the whole runtime,
- * fails the job with its error code and never retries it. Only a network
- * timeout is retried, once, at least 30 minutes later (two attempts maximum).
- * No proxy is rotated and no volume is moved to another account.
+ * Fail closed: a challenge, checkpoint, login redirect, HTTP 401/403/429/999 or
+ * a restriction page pauses reads AND outbound sending for the whole runtime,
+ * fails the job with its error code and never retries it. The pause is DURABLE
+ * (lib/radar/pause.ts): the incident outlives the process, and until a human
+ * acknowledges it through PUT /api/radar/control nothing can be enabled again —
+ * not by an operator and not by Radar's next provision. Only a network timeout
+ * is retried, once, at least 30 minutes later (two attempts maximum). No proxy
+ * is rotated and no volume is moved to another account.
  */
 import { createHash, randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
@@ -35,14 +40,21 @@ import {
   type ScheduleConfig,
 } from "@/lib/linkedin/schedule";
 import { markNeedsReauth } from "@/lib/linkedin/session";
-import { ProfileReadError, readProfileMinimal, type ProfileReader } from "@/lib/linkedin/profile-read";
+import {
+  ProfileReadError,
+  readProfileMinimal,
+  type NavigationGate,
+  type ProfileReader,
+} from "@/lib/linkedin/profile-read";
 import {
   buildRadarProfileReadCallback,
   canonicalLinkedInUrl,
   sanitizeProfileRead,
   type ProfileReadErrorCode,
   type RadarProfileReadInput,
+  type RuntimePauseReason,
 } from "./contracts";
+import { readRuntimePause, recordRuntimePause } from "./pause";
 
 /** Two attempts maximum, and only a network failure ever earns the second. */
 const MAX_ATTEMPTS = 2;
@@ -128,16 +140,21 @@ interface DailyUsage {
 }
 
 /**
- * The budget counts finished ATTEMPTS, not successes: `completed_at` is stamped
- * whenever an attempt has actually loaded a page, including a failure that will
- * be retried. A page view spends the account's safety margin either way.
+ * The budget counts NAVIGATIONS, not job rows and not successes. One read can
+ * open the profile, the experience page and a Sales Navigator lead page; that
+ * is three logged-in page views on a real account, and the cap exists to bound
+ * page views. Failed attempts count too: a page view spends the account's
+ * safety margin whether or not anything was parsed out of it.
+ *
+ * "Today" includes the job currently running (`locked_at`), so a chain in
+ * flight cannot overshoot by re-reading a stale count.
  */
 function dailyUsage(db: Database.Database, account: AccountRow, now = new Date()): DailyUsage {
   const dayStart = sqliteUtc(startOfLocalDay(account, now));
   const row = db.prepare(`
-    SELECT COUNT(*) AS used, MAX(completed_at) AS last_completed_at
+    SELECT COALESCE(SUM(navigations), 0) AS used, MAX(completed_at) AS last_completed_at
       FROM radar_profile_reads
-     WHERE completed_at IS NOT NULL AND completed_at >= ?
+     WHERE COALESCE(completed_at, locked_at, created_at) >= ?
   `).get(dayStart) as { used: number; last_completed_at: string | null };
   const overall = db.prepare(`
     SELECT MAX(completed_at) AS last_completed_at, MAX(read_at) AS last_read_at FROM radar_profile_reads
@@ -161,6 +178,7 @@ function earliestNextRead(usage: DailyUsage, gapMinutes: number): number {
 export interface ProfileReadStatus {
   enabled: boolean;
   dailyLimit: number;
+  /** LinkedIn navigations spent today, which is what the cap counts. */
   usedToday: number;
   lastReadAt: string | null;
 }
@@ -190,6 +208,9 @@ export function requestProfileRead(
   if (!runtime || runtime.reads_enabled !== 1 || runtime.daily_profile_read_limit <= 0) {
     return { outcome: "disabled" };
   }
+  // Belt and braces: the pause already zeroes `reads_enabled`, but a parked
+  // runtime must stay parked however that flag came back.
+  if (readRuntimePause(db)) return { outcome: "disabled" };
   const account = accountRow(db, runtime.account_id);
   if (!account || account.is_authenticated !== 1) return { outcome: "disabled" };
 
@@ -264,13 +285,17 @@ function enqueueCallback(
  * send limits and park the managed runs, so nothing leaves while a human looks
  * at the challenge. Nothing is rotated and no credential is touched.
  */
-function pauseRuntimeClosed(db: Database.Database, accountId: string, reason: string): void {
+function pauseRuntimeClosed(db: Database.Database, accountId: string, reason: RuntimePauseReason): void {
   db.transaction(() => {
     db.prepare(`
       UPDATE radar_runtime_config
          SET reads_enabled = 0, outbound_enabled = 0, updated_at = datetime('now')
        WHERE id = 1
     `).run();
+    // Durable: the two flags above are rewritten by the next provision, the
+    // incident is not. Nothing can be enabled again until a human acknowledges
+    // it through PUT /api/radar/control.
+    recordRuntimePause(db, reason);
     db.prepare(`
       UPDATE accounts SET daily_connection_limit = 0, daily_message_limit = 0, daily_inmail_limit = 0
        WHERE id = ?
@@ -312,6 +337,26 @@ function claimDueJob(db: Database.Database): JobRow | undefined {
 }
 
 /**
+ * The gate the reader must pass before every `page.goto`. It spends one unit of
+ * today's budget and refuses once there is none left, so the fallback chain
+ * stops mid-way and delivers a partial read instead of overshooting the cap to
+ * finish. The increment is persisted immediately: a read that dies after two
+ * navigations still shows two.
+ */
+function navigationGate(
+  db: Database.Database,
+  account: AccountRow,
+  dailyLimit: number,
+  jobId: string,
+): NavigationGate {
+  return () => {
+    if (dailyUsage(db, account).used >= dailyLimit) return false;
+    db.prepare("UPDATE radar_profile_reads SET navigations = navigations + 1 WHERE id = ?").run(jobId);
+    return true;
+  };
+}
+
+/**
  * One read per turn. Called from the runner's global loop BEFORE `tick()`, and
  * independent of it: reads work even when every campaign run is paused.
  */
@@ -323,6 +368,7 @@ export async function processProfileReads(
 
   const runtime = runtimeRow(db);
   if (!runtime || runtime.reads_enabled !== 1 || runtime.daily_profile_read_limit <= 0) return "idle";
+  if (readRuntimePause(db)) return "idle";
   const account = accountRow(db, runtime.account_id);
   if (!account || account.is_authenticated !== 1) return "idle";
   if (!isWithinSchedule(account)) return "idle";
@@ -334,8 +380,10 @@ export async function processProfileReads(
   const job = claimDueJob(db);
   if (!job) return "idle";
 
+  const navigate = navigationGate(db, account, runtime.daily_profile_read_limit, job.id);
+
   try {
-    const result = await read(account.id, job.linkedin_url);
+    const result = await read(account.id, job.linkedin_url, navigate);
     const readAt = new Date();
     db.prepare(`
       UPDATE radar_profile_reads

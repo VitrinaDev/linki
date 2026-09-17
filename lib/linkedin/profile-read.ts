@@ -15,24 +15,36 @@
  *      a line-based fallback; never a hashed class name).
  *   2. Voyager, called from inside the page with the session's own JSESSIONID
  *      csrf token — the same technique `scrapePosts` uses. Two candidate
- *      endpoints are tried and parsed defensively: LinkedIn rotates these and a
- *      failure here is free, because of (3).
+ *      endpoints are tried, because LinkedIn rotates them; a 404 or a shape we
+ *      cannot parse is free, a THROTTLE is not (see below).
  *   3. DOM fallback on `/in/<slug>/details/experience/`, walked structurally
  *      (main → ul → li → the aria-hidden text spans), never by class name.
  *   4. Only if the session actually carries a Sales Navigator seat cookie AND
  *      the steps above produced no position at all, one opportunistic Sales Nav
  *      profile load, intercepting `salesApiProfiles` exactly like
- *      profile-scrape.ts does. Best effort: any failure is swallowed.
+ *      profile-scrape.ts does.
+ *
+ * DETECTION IS UNIFORM. Every LinkedIn answer this file looks at — a
+ * navigation, the in-page Voyager fetch, the Sales Navigator load — goes
+ * through the same `classifyPage()`. A checkpoint, a login redirect, an HTTP
+ * 401/403/429/999 or restriction copy is an incident wherever it appears, and
+ * it fails closed. "Try the next URL" and "the account has no seat" are only
+ * allowed to explain an answer that carries NO such signal: a 404, an unparsable
+ * shape, a normal page. The earlier version swallowed a throttle on the Voyager
+ * path and a checkpoint on the Sales Navigator path as if they were shape
+ * problems, which is how a restricted account keeps browsing.
+ *
+ * THE CAP COUNTS NAVIGATIONS. Each `page.goto` asks the caller's `navigate()`
+ * gate first; the gate both spends one unit of the runtime's daily budget and
+ * refuses when there is none left. A refusal mid-chain stops the chain and the
+ * read delivers whatever it already has, `partial: true` — it never exceeds the
+ * budget to finish a fallback.
  *
  * When no position can be obtained the result is `positions: []` with
  * `partial: true` — nothing is ever inferred or filled in. When the page loads
  * but yields nothing at all (no headline, no location, no position) the read
  * fails with `partial`, so Radar hears about it instead of storing an empty
  * observation.
- *
- * Fail closed: a challenge, checkpoint, login redirect, HTTP 429/999 or an
- * account-restriction page raises ProfileReadError with `challenge` or
- * `rate_limited`, and the caller pauses BOTH reads and outbound sending.
  */
 import type { Locator, Page } from "playwright";
 import { getSessionPage } from "@/lib/linkedin/session";
@@ -45,19 +57,192 @@ export class ProfileReadError extends Error {
   }
 }
 
-export type ProfileReader = (accountId: string, linkedinUrl: string) => Promise<ProfileReadResult>;
+/**
+ * Spends one unit of the runtime's daily navigation budget and says whether it
+ * was there to spend. `false` means "stop the chain": deliver what you have,
+ * never open another page. A `true` answer has ALREADY consumed the unit, so
+ * the count is right even if the navigation then fails.
+ */
+export type NavigationGate = () => boolean;
+
+export type ProfileReader = (
+  accountId: string,
+  linkedinUrl: string,
+  navigate: NavigationGate,
+) => Promise<ProfileReadResult>;
 
 const NAV_TIMEOUT_MS = 30_000;
 const SALES_NAV_BUDGET_MS = 12_000;
+/** Enough to cover an interstitial; a full profile's text is far longer. */
+const MAX_MATCH_CHARS = 8_000;
+
+// ─── detection ────────────────────────────────────────────────────────────────
+
+/**
+ * What LinkedIn just told us.
+ *  - `challenge`     the session may no longer act (checkpoint, login, identity).
+ *  - `rate_limited`  LinkedIn is throttling or restricting this account.
+ *  - `limit_notice`  an informational quota message (weekly invitations). NOT an
+ *                    incident: it does not pause anything, it is only logged.
+ *  - `not_found`     this particular page is not there.
+ */
+export type PageSignal = "ok" | "challenge" | "rate_limited" | "limit_notice" | "not_found";
 
 // A checkpoint, an auth wall or a bounce to the login page all mean the same
 // thing: this session may no longer act. Matched on the URL, which LinkedIn
-// does not localise.
-const CHALLENGE_URL = /\/checkpoint\/|\/authwall|\/uas\/login|linkedin\.com\/login/i;
-// LinkedIn's throttling copy, EN + ES. Deliberately narrow: these phrases only
-// appear on an interstitial, never inside a normal profile.
-const RESTRICTION_TEXT = /too many requests|unusual activity|temporarily restricted|restricted your account|we.{0,3}ve restricted|has sido restringid|actividad inusual|demasiadas solicitudes|intenta de nuevo m[aá]s tarde/i;
-const NOT_FOUND_TEXT = /page doesn.{0,3}t exist|this page is not available|profile is not available|esta p[aá]gina no existe|perfil no est[aá] disponible/i;
+// does not localise. The two explicit checkpoint paths are the ones a live
+// account actually lands on.
+const CHALLENGE_URL =
+  /\/checkpoint\/challenge|\/checkpoint\/lg\/login-submit|\/checkpoint\/|\/authwall|\/uas\/login|linkedin\.com\/login/i;
+
+/**
+ * Case- and accent-insensitive matching. LinkedIn serves the same interstitial
+ * in the viewer's locale, with typographic apostrophes, so "Hemos restringido
+ * tu cuenta", "HEMOS RESTRINGIDO TU CUENTA" and "we’ve restricted your account"
+ * all have to hit. Patterns below are therefore written unaccented and lowercase.
+ */
+export function normalizeForMatch(raw: string): string {
+  return raw
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[‘’ʼ´`]/g, "'")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+function anyOf(patterns: string[]): RegExp {
+  return new RegExp(patterns.join("|"), "i");
+}
+
+/** "You have to prove who you are" — the session is unusable until a human acts. */
+const CHALLENGE_TEXT = anyOf([
+  "verify your identity",
+  "verifica tu identidad",
+  "verificar tu identidad",
+  "security verification",
+  "verificacion de seguridad",
+  "confirm your identity",
+  "confirma tu identidad",
+  "quick security check",
+  "let's do a quick security check",
+]);
+
+/**
+ * "You are doing too much" — LinkedIn is throttling or has restricted the
+ * account. Every one of these pauses the runtime.
+ */
+const RESTRICTION_TEXT = anyOf([
+  "too many requests",
+  "demasiadas solicitudes",
+  "unusual activity",
+  "actividad inusual",
+  "suspicious activity",
+  "actividad sospechosa",
+  "commercial use limit",
+  "limite de uso comercial",
+  "we ?'?ve restricted your account",
+  "restricted your account",
+  "hemos restringido tu cuenta",
+  "tu cuenta ha sido restringida",
+  "has sido restringid[oa]",
+  "temporarily restricted",
+  "restringid[oa] temporalmente",
+  "intenta de nuevo mas tarde",
+]);
+
+/**
+ * Informational quota copy. A weekly invitation limit says nothing about
+ * reading a profile and must NOT pause the runtime — but it is a real signal
+ * about the account's headroom, so it is logged every time it is seen.
+ */
+const LIMIT_NOTICE_TEXT = anyOf([
+  "you ?'?ve reached the weekly invitation limit",
+  "weekly invitation limit",
+  "has alcanzado el limite semanal de invitaciones",
+  "limite semanal de invitaciones",
+]);
+
+const NOT_FOUND_TEXT = anyOf([
+  "page doesn ?'?t exist",
+  "this page is not available",
+  "profile is not available",
+  "esta pagina no existe",
+  "perfil no esta disponible",
+]);
+
+function signalFromStatus(status: number | null | undefined): PageSignal | null {
+  if (status === null || status === undefined) return null;
+  // 999 is LinkedIn's own "request denied"; 403 is what the Voyager endpoints
+  // answer once the account is restricted. Both are throttles, never shapes.
+  if (status === 429 || status === 999 || status === 403) return "rate_limited";
+  if (status === 401) return "challenge";
+  if (status === 404 || status === 410) return "not_found";
+  return null;
+}
+
+export interface PageEvidence {
+  url: string;
+  status?: number | null;
+  body?: string | null;
+}
+
+/** The single classifier every LinkedIn answer in this file goes through. */
+export function classifyPage(evidence: PageEvidence): PageSignal {
+  if (CHALLENGE_URL.test(evidence.url)) return "challenge";
+  const byStatus = signalFromStatus(evidence.status);
+  if (byStatus) return byStatus;
+  const text = normalizeForMatch((evidence.body ?? "").slice(0, MAX_MATCH_CHARS));
+  if (CHALLENGE_TEXT.test(text)) return "challenge";
+  // Checked before the quota notice on purpose: an interstitial carrying both
+  // is a restriction, and the fail-closed reading wins.
+  if (RESTRICTION_TEXT.test(text)) return "rate_limited";
+  if (LIMIT_NOTICE_TEXT.test(text)) return "limit_notice";
+  if (NOT_FOUND_TEXT.test(text)) return "not_found";
+  return "ok";
+}
+
+const SIGNAL_MESSAGE: Record<Exclude<PageSignal, "ok" | "limit_notice">, string> = {
+  challenge: "LinkedIn asked for a checkpoint, a login or an identity verification",
+  rate_limited: "LinkedIn answered with a throttle or an account restriction",
+  not_found: "LinkedIn says that page does not exist",
+};
+
+function raise(signal: Exclude<PageSignal, "ok" | "limit_notice">, where: string): never {
+  throw new ProfileReadError(signal, `${SIGNAL_MESSAGE[signal]} (${where})`);
+}
+
+function noteLimitNotice(where: string): void {
+  console.warn(`[radar] LinkedIn showed an invitation-limit notice (${where}); logged, not a pause`);
+}
+
+async function signalOf(page: Page, status: number | null, sample?: string): Promise<PageSignal> {
+  const body = sample ?? await page.locator("body").innerText().catch(() => "");
+  return classifyPage({ url: page.url(), status, body });
+}
+
+/** Primary navigation: anything but a clean page stops the read. */
+async function assertUsable(page: Page, status: number | null, where: string): Promise<void> {
+  const signal = await signalOf(page, status);
+  if (signal === "limit_notice") return noteLimitNotice(where);
+  if (signal !== "ok") raise(signal, where);
+}
+
+/**
+ * Fallback navigation (the experience page, the Sales Navigator lead page).
+ * An incident is still an incident and fails the whole read — that is the fix:
+ * a checkpoint on the Sales Nav page used to be swallowed as "no seat". What a
+ * fallback IS allowed to do is give up quietly on a page that simply is not
+ * there or is a quota notice, because the profile page already succeeded and
+ * the read can honestly return `partial`.
+ */
+async function fallbackUsable(page: Page, status: number | null, where: string): Promise<boolean> {
+  const signal = await signalOf(page, status);
+  if (signal === "challenge" || signal === "rate_limited") raise(signal, where);
+  if (signal === "limit_notice") noteLimitNotice(where);
+  return signal === "ok";
+}
+
+// ─── parsing helpers ──────────────────────────────────────────────────────────
 
 const MONTHS: Record<string, number> = {
   jan: 1, ene: 1, feb: 2, mar: 3, apr: 4, abr: 4, may: 5, jun: 6, jul: 7,
@@ -82,26 +267,6 @@ function monthYear(raw: string | null | undefined): string | null {
 
 function isCurrentEnd(raw: string | null | undefined): boolean {
   return !!raw && PRESENT.test(raw.trim());
-}
-
-async function assertUsable(page: Page, status: number | null): Promise<void> {
-  if (status === 429 || status === 999) {
-    throw new ProfileReadError("rate_limited", `LinkedIn answered HTTP ${status}`);
-  }
-  if (status === 404 || status === 410) {
-    throw new ProfileReadError("not_found", `LinkedIn answered HTTP ${status}`);
-  }
-  if (CHALLENGE_URL.test(page.url())) {
-    throw new ProfileReadError("challenge", "LinkedIn redirected to a checkpoint, auth wall or login page");
-  }
-  const bodyText = await page.locator("body").innerText().catch(() => "");
-  const head = bodyText.slice(0, 4_000);
-  if (RESTRICTION_TEXT.test(head)) {
-    throw new ProfileReadError("rate_limited", "LinkedIn showed a restriction or rate-limit interstitial");
-  }
-  if (NOT_FOUND_TEXT.test(head)) {
-    throw new ProfileReadError("not_found", "LinkedIn showed a profile-unavailable page");
-  }
 }
 
 async function firstText(locator: Locator): Promise<string | null> {
@@ -182,40 +347,73 @@ function positionsFromVoyager(raw: string): ProfileReadPosition[] {
   return positions;
 }
 
+interface InPageFetch {
+  status: number;
+  url: string;
+  body: string;
+}
+
 /**
  * Voyager, fetched from inside the authenticated page with the session's own
- * csrf token. Endpoints rotate, so two candidates are tried and anything that
- * is not a 200 is simply skipped — the DOM fallback is the guarantee.
+ * csrf token. This costs no navigation, so it is not gated.
+ *
+ * The response goes through the SAME classifier as a navigation: a 403/429/999,
+ * a 401, a redirect to the login page or restriction copy in the body is a
+ * throttle or a checkpoint and stops the read. Only a shape problem — a 404, a
+ * body we cannot parse — earns "try the next endpoint".
  */
 async function positionsFromVoyagerApi(page: Page, publicId: string): Promise<ProfileReadPosition[]> {
+  let cookies: Array<{ name: string; value: string }>;
   try {
-    const cookies = await page.context().cookies();
-    const csrf = (cookies.find((c) => c.name === "JSESSIONID")?.value || "").replace(/"/g, "");
-    if (!csrf) return [];
-    const urls = [
-      `https://www.linkedin.com/voyager/api/identity/profiles/${encodeURIComponent(publicId)}/positions`,
-      `https://www.linkedin.com/voyager/api/identity/dash/profiles?q=memberIdentity&memberIdentity=${encodeURIComponent(publicId)}`,
-    ];
-    for (const url of urls) {
-      const raw = await page.evaluate(
+    cookies = await page.context().cookies();
+  } catch {
+    return [];
+  }
+  const csrf = (cookies.find((c) => c.name === "JSESSIONID")?.value || "").replace(/"/g, "");
+  if (!csrf) return [];
+
+  const urls = [
+    `https://www.linkedin.com/voyager/api/identity/profiles/${encodeURIComponent(publicId)}/positions`,
+    `https://www.linkedin.com/voyager/api/identity/dash/profiles?q=memberIdentity&memberIdentity=${encodeURIComponent(publicId)}`,
+  ];
+  for (const url of urls) {
+    let answer: InPageFetch | null;
+    try {
+      answer = await page.evaluate(
         async ({ url, csrf }: { url: string; csrf: string }) => {
-          const response = await fetch(url, {
-            headers: {
-              accept: "application/vnd.linkedin.normalized+json+2.1",
-              "csrf-token": csrf,
-              "x-restli-protocol-version": "2.0.0",
-            },
-            credentials: "include",
-          });
-          return response.status === 200 ? response.text() : "";
+          try {
+            const response = await fetch(url, {
+              headers: {
+                accept: "application/vnd.linkedin.normalized+json+2.1",
+                "csrf-token": csrf,
+                "x-restli-protocol-version": "2.0.0",
+              },
+              credentials: "include",
+            });
+            const body = await response.text().catch(() => "");
+            return { status: response.status, url: response.url || url, body: body.slice(0, 20_000) };
+          } catch {
+            // A transport failure inside the page says nothing about LinkedIn's
+            // opinion of us: status 0 is classified as a shape problem below.
+            return { status: 0, url, body: "" };
+          }
         },
         { url, csrf },
-      );
-      if (!raw) continue;
-      const positions = positionsFromVoyager(raw);
-      if (positions.length > 0) return positions;
+      ) as InPageFetch | null;
+    } catch {
+      // page.evaluate itself failed (navigation, closed context) — not a signal.
+      return [];
     }
-  } catch { /* fall through to the DOM */ }
+    if (!answer) continue;
+
+    const signal = classifyPage({ url: answer.url, status: answer.status || null, body: answer.body });
+    if (signal === "challenge" || signal === "rate_limited") raise(signal, "voyager");
+    if (signal === "limit_notice") noteLimitNotice("voyager");
+    if (answer.status !== 200) continue;
+
+    const positions = positionsFromVoyager(answer.body);
+    if (positions.length > 0) return positions;
+  }
   return [];
 }
 
@@ -229,7 +427,12 @@ async function positionsFromVoyagerApi(page: Page, publicId: string): Promise<Pr
  * "Company · Full-time"), the date range, then the location. Anything that does
  * not match stays null rather than being guessed.
  */
-async function positionsFromExperienceDom(page: Page, publicId: string): Promise<ProfileReadPosition[]> {
+async function positionsFromExperienceDom(
+  page: Page,
+  publicId: string,
+  navigate: NavigationGate,
+): Promise<ProfileReadPosition[]> {
+  if (!navigate()) return [];
   const navigated = await page.goto(
     `https://www.linkedin.com/in/${encodeURIComponent(publicId)}/details/experience/`,
     { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS },
@@ -238,7 +441,7 @@ async function positionsFromExperienceDom(page: Page, publicId: string): Promise
   // would otherwise be scraped as if they were positions. Give up instead.
   if (!navigated) return [];
   await page.waitForTimeout(2_000 + Math.random() * 1_500);
-  await assertUsable(page, navigated.response?.status() ?? null);
+  if (!await fallbackUsable(page, navigated.response?.status() ?? null, "details/experience")) return [];
   if (!/\/details\/experience/.test(page.url())) return [];
 
   const items = page.locator("main ul > li");
@@ -288,8 +491,17 @@ interface SalesFlatProfile {
  * Opportunistic only. `li_ep_auth_context` is the Sales Navigator seat cookie
  * (see lib/linkedin/session.ts) — without it the account has no seat and this
  * is skipped entirely. Nothing is configured and no seat is ever requested.
+ *
+ * "No seat" and "the lead URL shape changed" remain silent fallthroughs, but
+ * ONLY when the page that came back carries no incident signal. A checkpoint or
+ * a restriction here is the same incident as anywhere else and fails closed.
  */
-async function positionsFromSalesNav(page: Page, memberId: string): Promise<ProfileReadPosition[]> {
+async function positionsFromSalesNav(
+  page: Page,
+  memberId: string,
+  navigate: NavigationGate,
+): Promise<ProfileReadPosition[]> {
+  if (!navigate()) return [];
   const responses: SalesFlatProfile[] = [];
   const collect = async (resp: { url(): string; status(): number; json(): Promise<unknown> }) => {
     if (!resp.url().includes("salesApiProfiles") || resp.status() !== 200) return;
@@ -299,18 +511,21 @@ async function positionsFromSalesNav(page: Page, memberId: string): Promise<Prof
     } catch { /* ignore */ }
   };
   page.on("response", collect);
+  let status: number | null = null;
   try {
-    await page.goto(`https://www.linkedin.com/sales/lead/${encodeURIComponent(memberId)},NAME_SEARCH`, {
+    const response = await page.goto(`https://www.linkedin.com/sales/lead/${encodeURIComponent(memberId)},NAME_SEARCH`, {
       waitUntil: "domcontentloaded",
       timeout: SALES_NAV_BUDGET_MS,
-    });
-    await page.waitForTimeout(SALES_NAV_BUDGET_MS / 2);
-  } catch {
-    // No seat, a changed URL shape or a slow load — the read keeps whatever it
-    // already has and stays `partial`.
+    }).catch(() => null);
+    status = response?.status() ?? null;
+    await page.waitForTimeout(SALES_NAV_BUDGET_MS / 2).catch(() => {});
   } finally {
     page.off("response", collect);
   }
+
+  // Classified like any other navigation. Throws on a checkpoint or a throttle.
+  if (!await fallbackUsable(page, status, "sales navigator")) return [];
+
   const core = responses.find((entry) => entry.positions?.length);
   return (core?.positions ?? []).map((position) => ({
     title: position.title ?? null,
@@ -322,12 +537,25 @@ async function positionsFromSalesNav(page: Page, memberId: string): Promise<Prof
   }));
 }
 
-export async function readProfileMinimal(accountId: string, linkedinUrl: string): Promise<ProfileReadResult> {
+/**
+ * The reader proper, on a page the caller owns. Exported so the fallback chain
+ * can be driven with scripted LinkedIn answers in tests; production goes through
+ * `readProfileMinimal`, which takes the page from the shared session queue.
+ */
+export async function readProfileFromPage(
+  page: Page,
+  linkedinUrl: string,
+  navigate: NavigationGate,
+): Promise<ProfileReadResult> {
   const publicId = publicIdOf(linkedinUrl);
   if (!publicId) throw new ProfileReadError("not_found", "URL is not a LinkedIn /in/ profile");
 
-  const page = await getSessionPage(accountId);
   try {
+    if (!navigate()) {
+      // Unreachable through processProfileReads, which checks the budget before
+      // claiming a job; kept explicit so a future caller cannot overspend.
+      throw new ProfileReadError("partial", "The daily navigation budget was spent before the profile could be opened");
+    }
     const response = await page.goto(`https://www.linkedin.com/in/${encodeURIComponent(publicId)}/`, {
       waitUntil: "domcontentloaded",
       timeout: NAV_TIMEOUT_MS,
@@ -335,7 +563,7 @@ export async function readProfileMinimal(accountId: string, linkedinUrl: string)
       throw new ProfileReadError("network", error instanceof Error ? error.message : "navigation failed");
     });
     await page.waitForTimeout(3_000 + Math.random() * 2_000);
-    await assertUsable(page, response?.status() ?? null);
+    await assertUsable(page, response?.status() ?? null, "profile");
 
     const { headline, location } = await readTopCard(page);
     const memberId = await page.evaluate(
@@ -344,12 +572,12 @@ export async function readProfileMinimal(accountId: string, linkedinUrl: string)
 
     let positions = await positionsFromVoyagerApi(page, publicId);
     if (positions.length === 0) {
-      positions = await positionsFromExperienceDom(page, publicId);
+      positions = await positionsFromExperienceDom(page, publicId, navigate);
     }
     if (positions.length === 0 && memberId) {
       const cookies = await page.context().cookies().catch(() => []);
       const hasSalesSeat = cookies.some((cookie) => cookie.name === "li_ep_auth_context");
-      if (hasSalesSeat) positions = await positionsFromSalesNav(page, memberId);
+      if (hasSalesSeat) positions = await positionsFromSalesNav(page, memberId, navigate);
     }
 
     if (!headline && !location && positions.length === 0) {
@@ -360,7 +588,14 @@ export async function readProfileMinimal(accountId: string, linkedinUrl: string)
     if (error instanceof ProfileReadError) throw error;
     const message = error instanceof Error ? error.message : String(error);
     throw new ProfileReadError(/timeout|net::|ECONN|socket/i.test(message) ? "network" : "partial", message);
+  }
+}
+
+export const readProfileMinimal: ProfileReader = async (accountId, linkedinUrl, navigate) => {
+  const page = await getSessionPage(accountId);
+  try {
+    return await readProfileFromPage(page, linkedinUrl, navigate);
   } finally {
     await page.close().catch(() => {});
   }
-}
+};

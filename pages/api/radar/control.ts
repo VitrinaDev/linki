@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { ZodError } from "zod";
 import { radarControlSchema } from "@/lib/radar/contracts";
-import { controlRadarRuntime, RadarProvisionError } from "@/lib/radar/provisioning";
+import { controlRadarRuntime, RadarProvisionError, RadarRuntimePausedError } from "@/lib/radar/provisioning";
 
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "PUT") {
@@ -15,7 +15,12 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
       return res.status(400).json({ error: "Invalid Radar runtime control", issues: error.issues });
     }
     if (error instanceof RadarProvisionError) {
-      return res.status(error.statusCode).json({ error: error.message });
+      return res.status(error.statusCode).json({
+        error: error.message,
+        // 423: the runtime is parked after a LinkedIn incident. The operator
+        // clears it by repeating this call with `acknowledgePause: true`.
+        ...(error instanceof RadarRuntimePausedError ? { pause: error.pause } : {}),
+      });
     }
     const message = error instanceof Error ? error.message : "Unknown error";
     console.error("[radar] Runtime control failed:", message);

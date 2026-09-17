@@ -121,6 +121,7 @@ test("enforces a hard runtime pause and can explicitly retry failed managed trac
     dailyConnectionLimit: 2,
     dailyMessageLimit: 3,
     retryFailed: true,
+    acknowledgePause: false,
   };
   assert.throws(() => controlRadarRuntime(enableInput), /required proxy, and callbacks/);
   process.env.LINKI_REQUIRE_PROXY = "true";
@@ -135,6 +136,7 @@ test("enforces a hard runtime pause and can explicitly retry failed managed trac
     pausedRuns: 0,
     resumedRuns: 1,
     retriedTracks: 1,
+    acknowledgedPause: null,
   });
   assert.deepEqual(db.prepare("SELECT status FROM runs WHERE id = 'run-1'").get(), { status: "running" });
   assert.deepEqual(
@@ -147,6 +149,7 @@ test("enforces a hard runtime pause and can explicitly retry failed managed trac
     dailyConnectionLimit: 2,
     dailyMessageLimit: 3,
     retryFailed: false,
+    acknowledgePause: false,
   });
   assert.equal(paused.pausedRuns, 1);
   assert.deepEqual(

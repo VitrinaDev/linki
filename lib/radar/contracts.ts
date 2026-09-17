@@ -107,9 +107,29 @@ export const radarControlSchema = z.object({
   dailyConnectionLimit: z.number().int().min(0).max(15),
   dailyMessageLimit: z.number().int().min(0).max(20),
   retryFailed: z.boolean().optional().default(false),
+  // Clears a durable pause (see RUNTIME_PAUSE_REASONS) in this same request.
+  // While a pause is recorded NOTHING can be enabled — not sending, not reads,
+  // not resuming a parked run — so acknowledging it is the explicit human step
+  // that says "I looked at the incident". Acknowledge and enable may travel
+  // together: the pause is cleared first, then `enabled` is applied.
+  acknowledgePause: z.boolean().optional().default(false),
 }).strict();
 
 export type RadarControlInput = z.infer<typeof radarControlSchema>;
+
+/**
+ * Why the runtime is parked. Only these two: they are the incidents where
+ * LinkedIn itself told us to stop, and a human has to look before anything
+ * resumes. A network timeout is not one of them.
+ */
+export const RUNTIME_PAUSE_REASONS = ["challenge", "rate_limited"] as const;
+export type RuntimePauseReason = typeof RUNTIME_PAUSE_REASONS[number];
+
+export interface RuntimePause {
+  reason: RuntimePauseReason;
+  /** ISO-8601 UTC. */
+  at: string;
+}
 
 export const radarAccountSchema = z.object({
   name: z.string().trim().min(1).max(200),

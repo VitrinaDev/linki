@@ -70,6 +70,29 @@ account to zero sends while paused, changes limits, and can retry failed tracks.
 Start with 1 connection/day and 1 message/day and `enabled:false`; after a
 controlled test, opt in and raise gradually, never above 15/20.
 
+### The durable pause
+
+When LinkedIn answers a checkpoint or a throttle the runtime is parked: sending
+and reads go off, the managed runs are paused, and the incident itself is
+recorded on `radar_runtime_config` (`paused_reason` ∈ `challenge`,
+`rate_limited`, plus `paused_at`). It survives a restart and a redeploy, and
+while it stands **nothing can be enabled**: `PUT /api/radar/provision` with
+`outboundEnabled: true` or `readPolicy.enabled: true` and `PUT /api/radar/control`
+with `enabled: true` both answer
+
+```
+423 { "error": "Runtime is paused after a rate_limited incident at <iso>. …",
+      "pause": { "reason": "rate_limited", "at": "<iso>" } }
+```
+
+and write nothing. Clearing it is a human act: `PUT /api/radar/control` accepts
+`{"acknowledgePause": true}`, which clears the incident and returns it as
+`acknowledgedPause`. Acknowledge and enable may travel in the same request —
+the pause is cleared first, then `enabled` is applied, and if the enable is
+refused for another reason the whole call rolls back. Acknowledging does not
+turn reads back on; that stays a provision decision. `GET /api/radar/status`
+publishes `pause: { reason, at } | null`.
+
 ### Profile reads
 
 `POST /api/radar/profiles/read` takes `{ linkedinUrl, radar_persona_id }` and
@@ -92,19 +115,28 @@ workflow, so it is accepted while contacts are in flight.
 
 Jobs execute one at a time inside the existing session and page queue, only
 within the account's working hours, spaced by `minGapMinutes` plus jitter. The
+cap counts **navigations**, not jobs: one read can open the profile, the
+`/details/experience/` page and a Sales Navigator lead page, and each of those
+spends one unit of `dailyProfileReadLimit`. The chain re-checks the budget
+before every page and stops rather than exceed it, delivering what it already
+has with `partial: true`. The
 result travels back as a `profile.read` callback — the same envelope, signature
 and outbox as the other events — carrying exactly `linkedin_url`, `headline`,
 `location`, `partial`, `positions[{title, company, company_url, start, end,
 current}]` and `read_at`, and nothing else. A failure sends `profile.read.failed`
 with its `error_code`. Linki stores only the job row: the payload lives in the
 outbox and is deleted from it on delivery. No contact, run or track is ever
-created by a read. A challenge, checkpoint, login redirect, HTTP 429 or
-restriction page turns reads AND sending off for the whole runtime and fails the
-job without retrying; only a network timeout is retried, once, 30 minutes later.
-`GET /api/radar/status` reports `reads: { enabled, dailyLimit, usedToday,
-lastReadAt }`. Both switches ship off: turning them on is an explicit decision.
+created by a read. A challenge, checkpoint, login redirect, HTTP 401/403/429/999
+or a restriction page — on the profile page, on the in-page Voyager fetch or on
+the Sales Navigator page alike — turns reads AND sending off for the whole
+runtime, records the durable pause described above and fails the job without
+retrying; only a network timeout is retried, once, 30 minutes later. An
+informational quota notice (the weekly invitation limit) is logged and pauses
+nothing. `GET /api/radar/status` reports `reads: { enabled, dailyLimit,
+usedToday, lastReadAt }`, where `usedToday` is navigations. Both switches ship
+off: turning them on is an explicit decision.
 
-Pin deployments to `ghcr.io/vitrinadev/linki:v1.7.4-radar.8`; do not use the
+Pin deployments to `ghcr.io/vitrinadev/linki:v1.7.4-radar.9`; do not use the
 upstream `latest` image. Proxy credentials must stay in untracked `0600` env
 files or the deployment secret store and must never appear in logs or health
 checks.
@@ -239,7 +271,7 @@ docker run -d -p 3456:3000 \
   -e NEXTAUTH_SECRET=your_random_secret_here \
   -e AUTH_PASSWORD=your_password_here \
   -v $(pwd)/data:/data \
-  ghcr.io/vitrinadev/linki:v1.7.4-radar.8
+  ghcr.io/vitrinadev/linki:v1.7.4-radar.9
 ```
 
 Linki is now running at `http://localhost:3456`. The SQLite database is persisted in `./data/linki.db` on your host machine.

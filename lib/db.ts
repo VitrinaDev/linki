@@ -584,6 +584,18 @@ function runMigrations(db: Database.Database) {
        ON radar_profile_reads(radar_persona_id) WHERE state IN ('queued', 'running')`,
     "CREATE INDEX IF NOT EXISTS idx_radar_profile_reads_due ON radar_profile_reads(state, scheduled_at)",
     "CREATE INDEX IF NOT EXISTS idx_radar_profile_reads_completed ON radar_profile_reads(completed_at)",
+    // How many LinkedIn pages this job actually opened. The daily cap counts
+    // NAVIGATIONS, not job rows: the fallback chain (profile → details/experience
+    // → Sales Navigator) can spend three page views on a single read, and three
+    // page views are three page views as far as the account's safety margin is
+    // concerned.
+    "ALTER TABLE radar_profile_reads ADD COLUMN navigations INTEGER NOT NULL DEFAULT 0",
+    // Durable pause. A challenge or a throttle must outlive the process and the
+    // container: while `paused_reason` is set nothing can be enabled — not
+    // sending, not reads, not resuming a parked run — until a human acknowledges
+    // the incident through PUT /api/radar/control.
+    "ALTER TABLE radar_runtime_config ADD COLUMN paused_reason TEXT",
+    "ALTER TABLE radar_runtime_config ADD COLUMN paused_at TEXT",
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

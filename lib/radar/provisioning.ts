@@ -1,10 +1,33 @@
 import { createHash } from "node:crypto";
 import { getDb } from "@/lib/db";
-import { DISABLED_READ_POLICY, type RadarControlInput, type RadarProvisionInput, type RadarReadPolicy } from "./contracts";
+import {
+  DISABLED_READ_POLICY,
+  type RadarControlInput,
+  type RadarProvisionInput,
+  type RadarReadPolicy,
+  type RuntimePause,
+} from "./contracts";
+import { clearRuntimePause, readRuntimePause } from "./pause";
 
 export class RadarProvisionError extends Error {
   constructor(public readonly statusCode: number, message: string) {
     super(message);
+  }
+}
+
+/**
+ * 423 Locked: LinkedIn parked this runtime and no human has said otherwise yet.
+ * Carries the incident so the caller can show WHAT happened and WHEN instead of
+ * a generic refusal — Radar renders it on /linkedin, and the operator clears it
+ * with `PUT /api/radar/control {"acknowledgePause": true}`.
+ */
+export class RadarRuntimePausedError extends RadarProvisionError {
+  constructor(public readonly pause: RuntimePause) {
+    super(
+      423,
+      `Runtime is paused after a ${pause.reason} incident at ${pause.at}. `
+      + `Acknowledge it with PUT /api/radar/control {"acknowledgePause": true} before enabling anything.`,
+    );
   }
 }
 
@@ -25,6 +48,8 @@ export interface RadarControlResult {
   pausedRuns: number;
   resumedRuns: number;
   retriedTracks: number;
+  /** The incident this call cleared, or null when there was nothing to clear. */
+  acknowledgedPause: RuntimePause | null;
 }
 
 /**
@@ -85,6 +110,12 @@ function resolveSingleAuthenticatedAccount(): string {
  */
 function assertRuntimeCanEnable(accountId: string): void {
   const db = getDb();
+  // The durable pause comes FIRST: it names the incident, and it must not be
+  // possible to argue past it by re-provisioning with `outboundEnabled: true`
+  // or `readPolicy.enabled: true`, which is exactly what a Radar that does not
+  // know about the incident sends on its next campaign change.
+  const pause = readRuntimePause(db);
+  if (pause) throw new RadarRuntimePausedError(pause);
   const account = db.prepare(
     "SELECT is_authenticated FROM accounts WHERE id = ?",
   ).get(accountId) as { is_authenticated: number } | undefined;
@@ -254,6 +285,12 @@ export function controlRadarRuntime(input: RadarControlInput): RadarControlResul
     `).get() as { list_id: string; workflow_id: string; account_id: string } | undefined;
     if (!managed) throw new RadarProvisionError(409, "Radar campaign has not been provisioned");
 
+    // Acknowledge first, then enable: the two may travel in the same request,
+    // and that order is what lets an operator look at the incident and resume
+    // in one call. If the enable then fails for another reason the whole
+    // transaction rolls back, pause included — nothing is half applied.
+    const acknowledgedPause = input.acknowledgePause ? clearRuntimePause(db) : null;
+
     if (input.enabled) assertRuntimeCanEnable(managed.account_id);
 
     const connectionLimit = input.enabled ? input.dailyConnectionLimit : 0;
@@ -313,6 +350,7 @@ export function controlRadarRuntime(input: RadarControlInput): RadarControlResul
       pausedRuns: input.enabled ? 0 : Number(runChange.changes),
       resumedRuns: input.enabled ? Number(runChange.changes) : 0,
       retriedTracks,
+      acknowledgedPause,
     };
   })();
 }

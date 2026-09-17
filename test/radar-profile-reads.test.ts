@@ -22,6 +22,8 @@ let contracts: ContractsModule;
 let reads: ProfileReadsModule;
 let ProfileReadError: typeof import("../lib/linkedin/profile-read")["ProfileReadError"];
 let provisionRadarCampaign: typeof import("../lib/radar/provisioning")["provisionRadarCampaign"];
+let controlRadarRuntime: typeof import("../lib/radar/provisioning")["controlRadarRuntime"];
+let RadarRuntimePausedError: typeof import("../lib/radar/provisioning")["RadarRuntimePausedError"];
 let processRadarCallbacks: typeof import("../lib/radar/callbacks")["processRadarCallbacks"];
 let getRadarRuntimeStatus: typeof import("../lib/radar/runtime")["getRadarRuntimeStatus"];
 
@@ -101,6 +103,8 @@ before(async () => {
   reads = await import("../lib/radar/profile-reads");
   ProfileReadError = (await import("../lib/linkedin/profile-read")).ProfileReadError;
   provisionRadarCampaign = (await import("../lib/radar/provisioning")).provisionRadarCampaign;
+  controlRadarRuntime = (await import("../lib/radar/provisioning")).controlRadarRuntime;
+  RadarRuntimePausedError = (await import("../lib/radar/provisioning")).RadarRuntimePausedError;
   processRadarCallbacks = (await import("../lib/radar/callbacks")).processRadarCallbacks;
   getRadarRuntimeStatus = (await import("../lib/radar/runtime")).getRadarRuntimeStatus;
 
@@ -115,6 +119,8 @@ before(async () => {
 beforeEach(() => {
   db.prepare("DELETE FROM radar_profile_reads").run();
   db.prepare("DELETE FROM radar_callback_outbox").run();
+  // Each test starts un-parked; the pause tests below park it themselves.
+  db.prepare("UPDATE radar_runtime_config SET paused_reason = NULL, paused_at = NULL WHERE id = 1").run();
   openTheWorkingDay();
 });
 
@@ -225,9 +231,11 @@ test("queues one job per Persona and repeats the open job id instead of a second
 
 test("spaces reads by the minimum gap and answers 429 once the day's budget is spent", () => {
   setRuntimeReads(true, 2, 10);
+  // One navigation each: the cap counts page views, not rows.
   const completed = (id: string, minutesAgo: number) => db.prepare(`
-    INSERT INTO radar_profile_reads (id, radar_persona_id, linkedin_url, state, attempts, completed_at, read_at)
-    VALUES (?, ?, ?, 'done', 1, datetime('now', ?), datetime('now', ?))
+    INSERT INTO radar_profile_reads
+      (id, radar_persona_id, linkedin_url, state, attempts, navigations, completed_at, read_at)
+    VALUES (?, ?, ?, 'done', 1, 1, datetime('now', ?), datetime('now', ?))
   `).run(id, `${id}-persona`, PROFILE_URL, `-${minutesAgo} minutes`, `-${minutesAgo} minutes`);
 
   completed("job-a", 1);
@@ -289,7 +297,8 @@ test("executes one read, ships the signed callback, redacts it, and creates no c
   assert.equal(queued.outcome, "queued");
 
   const seen: Array<{ accountId: string; url: string }> = [];
-  const tick = await reads.processProfileReads(db, async (accountId, url) => {
+  const tick = await reads.processProfileReads(db, async (accountId, url, navigate) => {
+    assert.equal(navigate(), true, "the profile page is one navigation");
     seen.push({ accountId, url });
     return readResult;
   });
@@ -365,9 +374,10 @@ test("executes one read, ships the signed callback, redacts it, and creates no c
 test("an empty position list is a partial read, not a failure", async () => {
   setRuntimeReads(true, 20);
   reads.requestProfileRead({ linkedinUrl: PROFILE_URL, radar_persona_id: PERSONA });
-  const tick = await reads.processProfileReads(db, async () => ({
-    headline: "Solo titular", location: null, partial: true, positions: [],
-  }));
+  const tick = await reads.processProfileReads(db, async (_accountId, _url, navigate) => {
+    navigate();
+    return { headline: "Solo titular", location: null, partial: true, positions: [] };
+  });
   assert.equal(tick, "done");
   const payload = JSON.parse(
     (db.prepare("SELECT payload_json FROM radar_callback_outbox").get() as { payload_json: string }).payload_json,
@@ -386,7 +396,8 @@ test("a challenge pauses reads AND sending, fails the job and never retries it",
   db.prepare("UPDATE radar_runtime_config SET outbound_enabled = 1 WHERE id = 1").run();
   reads.requestProfileRead({ linkedinUrl: PROFILE_URL, radar_persona_id: PERSONA });
 
-  const tick = await reads.processProfileReads(db, async () => {
+  const tick = await reads.processProfileReads(db, async (_accountId, _url, navigate) => {
+    navigate();
     throw new ProfileReadError("challenge", "checkpoint");
   });
   assert.equal(tick, "failed");
@@ -424,7 +435,8 @@ test("a rate limit pauses the runtime but leaves the session authenticated", asy
   setRuntimeReads(true, 20);
   db.prepare("UPDATE accounts SET is_authenticated = 1 WHERE id = 'founder-1'").run();
   reads.requestProfileRead({ linkedinUrl: PROFILE_URL, radar_persona_id: PERSONA });
-  const tick = await reads.processProfileReads(db, async () => {
+  const tick = await reads.processProfileReads(db, async (_accountId, _url, navigate) => {
+    navigate();
     throw new ProfileReadError("rate_limited", "HTTP 429");
   });
   assert.equal(tick, "failed");
@@ -447,7 +459,10 @@ test("only a network failure is retried, once, at least thirty minutes later", a
   db.prepare("UPDATE accounts SET is_authenticated = 1 WHERE id = 'founder-1'").run();
   reads.requestProfileRead({ linkedinUrl: PROFILE_URL, radar_persona_id: PERSONA });
 
-  const failNetwork = async () => { throw new ProfileReadError("network", "Timeout 30000ms exceeded"); };
+  const failNetwork = async (_accountId: string, _url: string, navigate: () => boolean) => {
+    navigate();
+    throw new ProfileReadError("network", "Timeout 30000ms exceeded");
+  };
   assert.equal(await reads.processProfileReads(db, failNetwork), "retry");
 
   const retried = db.prepare(`
@@ -501,5 +516,129 @@ test("reads wait for the account's working hours", async () => {
     db.prepare("SELECT state, attempts FROM radar_profile_reads").get(),
     { state: "queued", attempts: 0 },
   );
+  openTheWorkingDay();
+});
+
+test("a throttled read parks the runtime durably: no provision may re-enable it unacknowledged", async () => {
+  readyRuntimeEnv();
+  setRuntimeReads(true, 20);
+  db.prepare("UPDATE accounts SET is_authenticated = 1 WHERE id = 'founder-1'").run();
+  db.prepare("INSERT INTO targets (id, linkedin_url) VALUES ('t-pause', 'https://www.linkedin.com/in/t-pause')").run();
+  db.prepare(`
+    INSERT INTO runs (id, workflow_id, list_id, account_id, status)
+    VALUES ('run-pause', ?, ?, 'founder-1', 'paused')
+  `).run(manifest.workflowId, manifest.listId);
+
+  reads.requestProfileRead({ linkedinUrl: PROFILE_URL, radar_persona_id: PERSONA });
+  assert.equal(
+    await reads.processProfileReads(db, async (_accountId, _url, navigate) => {
+      navigate();
+      throw new ProfileReadError("rate_limited", "LinkedIn answered HTTP 429");
+    }),
+    "failed",
+  );
+
+  const parked = db.prepare(
+    "SELECT paused_reason, paused_at FROM radar_runtime_config WHERE id = 1",
+  ).get() as { paused_reason: string; paused_at: string };
+  assert.equal(parked.paused_reason, "rate_limited");
+  assert.ok(parked.paused_at, "the incident must carry its timestamp");
+  assert.deepEqual(getRadarRuntimeStatus().pause, {
+    reason: "rate_limited",
+    at: new Date(`${parked.paused_at.replace(" ", "T")}Z`).toISOString(),
+  });
+
+  // The next campaign change from a Radar that knows nothing about the incident.
+  const eagerManifest = {
+    ...manifest,
+    outboundEnabled: true,
+    readPolicy: { enabled: true, dailyProfileReadLimit: 20, minGapMinutes: 3 },
+  };
+  assert.throws(() => provisionRadarCampaign(eagerManifest), (error: unknown) => {
+    assert.ok(error instanceof RadarRuntimePausedError);
+    assert.equal(error.statusCode, 423);
+    assert.equal(error.pause.reason, "rate_limited");
+    assert.match(error.message, /rate_limited/);
+    assert.match(error.message, /acknowledgePause/);
+    return true;
+  });
+  // Resuming the parked runs is refused for the same reason.
+  assert.throws(
+    () => controlRadarRuntime({
+      enabled: true, dailyConnectionLimit: 1, dailyMessageLimit: 1,
+      retryFailed: false, acknowledgePause: false,
+    }),
+    RadarRuntimePausedError,
+  );
+
+  assert.deepEqual(
+    db.prepare("SELECT reads_enabled, outbound_enabled FROM radar_runtime_config WHERE id = 1").get(),
+    { reads_enabled: 0, outbound_enabled: 0 },
+  );
+  assert.deepEqual(db.prepare("SELECT status FROM runs WHERE id = 'run-pause'").get(), { status: "paused" });
+  // And a parked runtime reads nothing, however `reads_enabled` got back to 1.
+  setRuntimeReads(true, 20);
+  assert.deepEqual(
+    reads.requestProfileRead({ linkedinUrl: PROFILE_URL, radar_persona_id: OTHER_PERSONA }),
+    { outcome: "disabled" },
+  );
+  assert.equal(await reads.processProfileReads(db, async () => readResult), "idle");
+
+  // The human step, and only then does the same manifest take effect.
+  const acknowledged = controlRadarRuntime({
+    enabled: false, dailyConnectionLimit: 0, dailyMessageLimit: 0,
+    retryFailed: false, acknowledgePause: true,
+  });
+  assert.equal(acknowledged.acknowledgedPause?.reason, "rate_limited");
+  assert.ok(acknowledged.acknowledgedPause?.at);
+  assert.equal(getRadarRuntimeStatus().pause, null);
+
+  const provisioned = provisionRadarCampaign(eagerManifest);
+  assert.equal(provisioned.outboundEnabled, true);
+  assert.equal(provisioned.readsEnabled, true);
+  assert.deepEqual(
+    db.prepare("SELECT reads_enabled, outbound_enabled FROM radar_runtime_config WHERE id = 1").get(),
+    { reads_enabled: 1, outbound_enabled: 1 },
+  );
+
+  provisionRadarCampaign(manifest);
+  db.prepare("DELETE FROM runs WHERE id = 'run-pause'").run();
+  db.prepare("DELETE FROM targets WHERE id = 't-pause'").run();
+  clearRuntimeEnv();
+  openTheWorkingDay();
+});
+
+test("acknowledging and enabling may travel in one control call, in that order", async () => {
+  readyRuntimeEnv();
+  setRuntimeReads(true, 20);
+  db.prepare("UPDATE accounts SET is_authenticated = 1 WHERE id = 'founder-1'").run();
+  reads.requestProfileRead({ linkedinUrl: PROFILE_URL, radar_persona_id: PERSONA });
+  await reads.processProfileReads(db, async (_accountId, _url, navigate) => {
+    navigate();
+    throw new ProfileReadError("rate_limited", "LinkedIn answered HTTP 429");
+  });
+
+  const resumed = controlRadarRuntime({
+    enabled: true, dailyConnectionLimit: 1, dailyMessageLimit: 1,
+    retryFailed: false, acknowledgePause: true,
+  });
+  assert.equal(resumed.acknowledgedPause?.reason, "rate_limited");
+  assert.equal(resumed.enabled, true);
+  assert.deepEqual(
+    db.prepare("SELECT paused_reason, paused_at, outbound_enabled FROM radar_runtime_config WHERE id = 1").get(),
+    { paused_reason: null, paused_at: null, outbound_enabled: 1 },
+  );
+  // Acknowledging says "I looked", not "read again": reads stay off until the
+  // owner provisions them back on.
+  assert.deepEqual(
+    db.prepare("SELECT reads_enabled FROM radar_runtime_config WHERE id = 1").get(),
+    { reads_enabled: 0 },
+  );
+
+  controlRadarRuntime({
+    enabled: false, dailyConnectionLimit: 0, dailyMessageLimit: 0,
+    retryFailed: false, acknowledgePause: false,
+  });
+  clearRuntimeEnv();
   openTheWorkingDay();
 });
