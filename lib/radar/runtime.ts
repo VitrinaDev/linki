@@ -1,3 +1,4 @@
+import { initializeManagedSchema } from "./managed-conversations";
 import { randomUUID } from "node:crypto";
 import { getDb } from "@/lib/db";
 import type { RadarAccountInput } from "./contracts";
@@ -45,6 +46,7 @@ export function upsertRadarAccount(input: RadarAccountInput) {
 
 export function getRadarRuntimeStatus() {
   const db = getDb();
+  initializeManagedSchema(db);
   const accounts = db.prepare(`SELECT ${ACCOUNT_COLUMNS} FROM accounts ORDER BY created_at`).all() as Array<Record<string, unknown>>;
   const managed = db.prepare(`
     SELECT rc.list_id, rc.workflow_id, rc.account_id, rc.outbound_enabled,
@@ -81,6 +83,7 @@ export function getRadarRuntimeStatus() {
 
   return {
     schemaVersion: 1,
+    managedConversations: { protocol: "linkedin-managed-v1", threads: db.prepare("SELECT thread_id,complete,gap FROM radar_managed_thread ORDER BY thread_id").all(), uncertain: (db.prepare("SELECT count(*) n FROM radar_controlled_send WHERE state IN ('iniciado','incierto')").get() as {n:number}).n },
     healthy: accounts.length <= 1,
     account: accounts[0] ?? null,
     accountCount: accounts.length,

@@ -1,3 +1,4 @@
+import { processManagedCallbacks } from "./managed-conversations";
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import {
@@ -97,6 +98,7 @@ function claimDueRows(db: Database.Database): OutboxRow[] {
 
 export async function processRadarCallbacks(db: Database.Database): Promise<void> {
   harvestRadarCallbacks(db);
+  await processManagedCallbacks(db);
 
   const callback = getRadarCallbackConfig();
   if (!callback) {
