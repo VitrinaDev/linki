@@ -12,6 +12,7 @@ import { visitProfile } from "@/lib/linkedin/visit";
 import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError } from "@/lib/linkedin/connect";
 import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
 import { shouldSyncAccepted, syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
+import { authorizeNativeClick, prepareNativeInvitation, RadarAuthorityError, type NativeClickAuthority } from "@/lib/radar/cold-authority";
 import { prepareControlledSend, recordControlledOutcome, recordControlledLegacyContext, syncManagedThreads } from "@/lib/radar/managed-conversations";
 import { readWholeThread, threadFromUrl } from "@/lib/linkedin/radar-thread-reader";
 import { shouldSyncRadarInbox, syncRadarInbox } from "@/lib/linkedin/sync-radar-replies";
@@ -505,8 +506,16 @@ async function executeStep(
       db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
       log(db, runId, target.id, "info", `Sending connection request to ${name}`);
       const linkedinUrl = await getLinkedinUrl(db, target, accountId);
+      const binding=freshTarget as Target & {radar_lead_id?:string;radar_market_id?:string};
+      if(binding.radar_lead_id&&!binding.radar_market_id){trSkip(db,tr,'Radar managed Mercado binding missing; invitation blocked');return;}
+      const controlled=binding.radar_lead_id&&binding.radar_market_id?prepareNativeInvitation(db,{stepKey:`${tr.id}:${step.id}`,targetId:target.id,accountId,marketId:binding.radar_market_id,counterpart:linkedinUrl}):null;
+      if(controlled&&!controlled.send){trSkip(db,tr,'Controlled invitation awaiting native reconciliation; repetition blocked');return;}
       const page = await getSessionPage(accountId);
-      try { await sendConnectionRequest(page, linkedinUrl); } finally { await page.close(); }
+      const authority:NativeClickAuthority|undefined=controlled?()=>authorizeNativeClick(db,{intentId:controlled.id,targetId:target.id,pertenenciaId:binding.radar_lead_id!,marketId:binding.radar_market_id!,accountId,threadId:null,action:'connection'}):undefined;
+      try { await sendConnectionRequest(page, linkedinUrl, authority); } catch(error) {
+        if(controlled&&error instanceof RadarAuthorityError){trSkip(db,tr,'Radar native authority blocked invitation; reconciliation required');return;}
+        throw error;
+      } finally { await page.close(); }
       await saveSessionState(accountId);
       db.prepare("UPDATE targets SET connection_requested_at = ? WHERE id = ?").run(nowIso(), target.id);
       trWait(db, tr, CONNECTION_RECHECK_HOURS);
@@ -601,7 +610,8 @@ async function executeStep(
       const page = await getSessionPage(accountId);
       try {
         if (!target.full_name) throw new Error(`Target ${target.id} has no full_name — cannot search messaging`);
-        const result = await sendMessage(page, target.full_name, messageText, messageLinkedinUrl, freshTarget.messaging_urn);
+        const authority:NativeClickAuthority|undefined=controlled ? () => authorizeNativeClick(db,{intentId:controlled.id,targetId:target.id,pertenenciaId:(freshTarget as Target & {radar_lead_id:string}).radar_lead_id,marketId:managedMarket!,accountId,threadId:threadFromUrl(page.url())}) : undefined;
+        const result = await sendMessage(page, target.full_name, messageText, messageLinkedinUrl, freshTarget.messaging_urn, authority);
         if(controlled) {
           const nativeThread=threadFromUrl(page.url());let proof=null;
           if(nativeThread) { try { const candidates=(await readWholeThread(page,nativeThread,messageLinkedinUrl)).filter(m=>m.direction==="saliente" && m.text===messageText && Date.parse(m.occurredAt)>=Date.now()-120000);if(candidates.length===1)proof=candidates[0]; } catch { /* Click success never proves a native message. */ } }
@@ -612,6 +622,13 @@ async function executeStep(
           db.prepare("UPDATE targets SET messaging_urn = COALESCE(messaging_urn, ?) WHERE id = ?").run(result.messagingUrn, target.id);
         }
       } catch (err) {
+        if(controlled && err instanceof RadarAuthorityError) {
+          // A denied/expired permission proves no click; a physical timeout
+          // leaves its result unknown. Both keep one-use consumption and never
+          // invent a delivery fact or retry without reconciliation.
+          db.prepare("UPDATE radar_controlled_send SET state='incierto' WHERE id=? AND state='iniciado'").run(controlled.id);
+          trSkip(db,tr,"Radar native authority blocked send; reconciliation required");return;
+        }
         if(controlled) recordControlledOutcome(db,controlled.id,null);
         if (err instanceof NotConnectedError) {
           await saveSessionState(accountId);

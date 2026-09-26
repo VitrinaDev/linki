@@ -1,4 +1,5 @@
 import type { Page } from "playwright";
+import { clickWithNativeAuthority, type NativeClickAuthority } from "../radar/cold-authority";
 import { visitProfile } from "./visit";
 
 export class NotConnectedError extends Error {}
@@ -33,12 +34,13 @@ export async function sendMessage(
   fullName: string,
   text: string,
   linkedinUrl: string,
-  messagingUrn?: string | null
+  messagingUrn?: string | null,
+  beforeNativeClick?: NativeClickAuthority
 ): Promise<SendMessageResult> {
   if (messagingUrn) {
     const opened = await openComposeByUrn(page, messagingUrn);
     if (opened) {
-      await sendFromComposeBox(page, text);
+      await sendFromComposeBox(page, text, beforeNativeClick);
       return { messagingUrn, isFirstDegree: true };
     }
   }
@@ -47,7 +49,7 @@ export async function sendMessage(
   if (resolved.messagingUrn) {
     const opened = await openComposeByUrn(page, resolved.messagingUrn);
     if (opened) {
-      await sendFromComposeBox(page, text);
+      await sendFromComposeBox(page, text, beforeNativeClick);
       return resolved;
     }
   }
@@ -57,7 +59,7 @@ export async function sendMessage(
 
   // Connected, but no message link could be resolved live (unusual layout) —
   // last-resort fallback to name search.
-  await sendMessageViaTypeahead(page, fullName, text);
+  await sendMessageViaTypeahead(page, fullName, text, beforeNativeClick);
   return resolved;
 }
 
@@ -75,7 +77,7 @@ async function openComposeByUrn(page: Page, messagingUrn: string): Promise<boole
   }
 }
 
-async function sendMessageViaTypeahead(page: Page, fullName: string, text: string): Promise<void> {
+async function sendMessageViaTypeahead(page: Page, fullName: string, text: string, beforeNativeClick?: NativeClickAuthority): Promise<void> {
   await page.goto("https://www.linkedin.com/messaging/thread/new/", {
     waitUntil: "domcontentloaded",
     timeout: 30000,
@@ -104,7 +106,7 @@ async function sendMessageViaTypeahead(page: Page, fullName: string, text: strin
   await firstResult.click({ delay: 100 });
   await page.waitForTimeout(800);
 
-  await sendFromComposeBox(page, text);
+  await sendFromComposeBox(page, text, beforeNativeClick);
 }
 
 function resultNameMatches(resultText: string, fullName: string): boolean {
@@ -115,7 +117,7 @@ function resultNameMatches(resultText: string, fullName: string): boolean {
   return normalize(resultText).includes(target);
 }
 
-async function sendFromComposeBox(page: Page, text: string): Promise<void> {
+async function sendFromComposeBox(page: Page, text: string, beforeNativeClick?: NativeClickAuthority): Promise<void> {
   // Paste message into compose area
   const msgInput = page.locator("div.msg-form__contenteditable").first();
   await msgInput.waitFor({ timeout: 8000 });
@@ -133,6 +135,7 @@ async function sendFromComposeBox(page: Page, text: string): Promise<void> {
   // Send
   const sendBtn = page.locator("button.msg-form__send-button:visible").first();
   await sendBtn.waitFor({ timeout: 5000 });
-  await sendBtn.click({ delay: 100 });
+  if (beforeNativeClick) await clickWithNativeAuthority(sendBtn, beforeNativeClick);
+  else await sendBtn.click({ delay: 100 });
   await page.waitForTimeout(2000);
 }

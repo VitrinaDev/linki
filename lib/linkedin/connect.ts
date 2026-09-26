@@ -1,4 +1,5 @@
 import type { Page } from "playwright";
+import { clickWithNativeAuthority, type NativeClickAuthority } from "../radar/cold-authority";
 
 export class WeeklyLimitError extends Error {}
 export class AlreadyConnectedError extends Error {}
@@ -10,7 +11,7 @@ export class PendingInviteError extends Error {}
  * Throws WeeklyLimitError if the weekly limit popup appears.
  * Throws AlreadyConnectedError / PendingInviteError if already in that state.
  */
-export async function sendConnectionRequest(page: Page, linkedinUrl: string): Promise<void> {
+export async function sendConnectionRequest(page: Page, linkedinUrl: string, beforeNativeClick?: NativeClickAuthority): Promise<void> {
   await page.goto(linkedinUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
   await page.waitForTimeout(2000 + Math.random() * 1000);
 
@@ -72,8 +73,11 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string): Pr
     'button:has-text("Send now"), button[aria-label*="Send without"], button[aria-label*="Send invitation"]:not([aria-label*="note"])'
   );
   if (await sendBtn.count() > 0) {
-    await sendBtn.first().click({ force: true });
+    if (beforeNativeClick) await clickWithNativeAuthority(sendBtn.first(), beforeNativeClick);
+    else await sendBtn.first().click({ force: true });
     await page.waitForTimeout(1500);
+  } else if (beforeNativeClick) {
+    throw new Error('Native invitation send button unavailable');
   }
 
   // Check for weekly limit popup
