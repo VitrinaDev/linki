@@ -131,7 +131,7 @@ export async function syncRadarInbox(accountId: string): Promise<number> {
     FROM targets t
     JOIN run_profiles rp ON rp.target_id = t.id
     JOIN runs r ON r.id = rp.run_id
-    WHERE r.account_id = ? AND t.radar_lead_id IS NOT NULL
+    WHERE r.account_id = ? AND t.radar_lead_id IS NOT NULL AND t.radar_market_id IS NULL
       AND t.message_sent_at IS NOT NULL AND t.last_replied_at IS NULL
   `).all(accountId) as RadarTarget[];
   if (targets.length === 0) {

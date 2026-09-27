@@ -517,6 +517,7 @@ function runMigrations(db: Database.Database) {
     // cross-system identity; radar_status is re-checked immediately before
     // every LinkedIn action so a cross-channel reply can stop queued work.
     "ALTER TABLE targets ADD COLUMN radar_lead_id TEXT",
+    "ALTER TABLE targets ADD COLUMN radar_market_id TEXT",
     "ALTER TABLE targets ADD COLUMN icebreaker_context TEXT",
     "ALTER TABLE targets ADD COLUMN radar_status TEXT DEFAULT 'QUEUED' CHECK(radar_status IN ('QUEUED', 'CONNECTED', 'REPLIED', 'PAUSED'))",
     "ALTER TABLE accounts ADD COLUMN radar_inbox_synced_at TEXT",

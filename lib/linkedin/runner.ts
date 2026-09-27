@@ -12,6 +12,8 @@ import { visitProfile } from "@/lib/linkedin/visit";
 import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError } from "@/lib/linkedin/connect";
 import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
 import { shouldSyncAccepted, syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
+import { prepareControlledSend, recordControlledOutcome, recordControlledLegacyContext, syncManagedThreads } from "@/lib/radar/managed-conversations";
+import { readWholeThread, threadFromUrl } from "@/lib/linkedin/radar-thread-reader";
 import { shouldSyncRadarInbox, syncRadarInbox } from "@/lib/linkedin/sync-radar-replies";
 import { processRadarCallbacks } from "@/lib/radar/callbacks";
 import { processProfileReads } from "@/lib/radar/profile-reads";
@@ -592,14 +594,25 @@ async function executeStep(
       db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
       log(db, runId, target.id, "info", `Sending message to ${name}`);
       const messageLinkedinUrl = await getLinkedinUrl(db, target, accountId);
+      const managedMarket=(freshTarget as Target & {radar_market_id?:string}).radar_market_id;
+      if((freshTarget as Target & {radar_lead_id?:string}).radar_lead_id && !managedMarket) {trSkip(db,tr,"Radar managed Mercado binding missing; send blocked");return;}
+      const controlled=(freshTarget as Target & {radar_lead_id?:string}).radar_lead_id && managedMarket ? prepareControlledSend(db,{stepKey:`${tr.id}:${step.id}`,targetId:target.id,accountId,marketId:managedMarket,counterpart:messageLinkedinUrl,text:messageText,trackId:tr.id,sourceContext:freshTarget.icebreaker_context}) : null;
+      if(controlled && !controlled.send) { trSkip(db,tr,"Controlled send awaiting native reconciliation; repetition blocked");return; }
       const page = await getSessionPage(accountId);
       try {
         if (!target.full_name) throw new Error(`Target ${target.id} has no full_name — cannot search messaging`);
         const result = await sendMessage(page, target.full_name, messageText, messageLinkedinUrl, freshTarget.messaging_urn);
+        if(controlled) {
+          const nativeThread=threadFromUrl(page.url());let proof=null;
+          if(nativeThread) { try { const candidates=(await readWholeThread(page,nativeThread,messageLinkedinUrl)).filter(m=>m.direction==="saliente" && m.text===messageText && Date.parse(m.occurredAt)>=Date.now()-120000);if(candidates.length===1)proof=candidates[0]; } catch { /* Click success never proves a native message. */ } }
+          recordControlledOutcome(db,controlled.id,proof);
+          if(!proof) {trSkip(db,tr,"Native send receipt uncertain; repetition blocked");return;}
+        }
         if (result.messagingUrn) {
           db.prepare("UPDATE targets SET messaging_urn = COALESCE(messaging_urn, ?) WHERE id = ?").run(result.messagingUrn, target.id);
         }
       } catch (err) {
+        if(controlled) recordControlledOutcome(db,controlled.id,null);
         if (err instanceof NotConnectedError) {
           await saveSessionState(accountId);
           db.prepare("UPDATE targets SET degree = NULL, connected_at = NULL WHERE id = ?").run(target.id);
@@ -612,8 +625,9 @@ async function executeStep(
         await page.close();
       }
       await saveSessionState(accountId);
+      if(controlled && !recordControlledLegacyContext(db,controlled.id,tr.id,messageText)) {trSkip(db,tr,"Radar managed scope retired; context write blocked");return;}
       db.prepare("UPDATE targets SET message_sent_at = ? WHERE id = ?").run(nowIso(), target.id);
-      trRecordContext(db, tr, { linkedinMessage: messageText });
+      if(!controlled)trRecordContext(db, tr, { linkedinMessage: messageText });
       trAdvance(db, tr, steps);
       log(db, runId, target.id, "info", `Message sent to ${name}`);
 
@@ -908,6 +922,10 @@ async function globalLoop(): Promise<void> {
 
   while (true) {
     const radarAccountId = getOptionalRadarConfig()?.accountId;
+    if(radarAccountId) {
+      try { await syncManagedThreads(radarAccountId,db); }
+      catch(err) { console.error("[radar] Managed thread recovery:",err instanceof Error ? err.message : "unavailable"); }
+    }
     if (radarAccountId && shouldSyncRadarInbox(radarAccountId)) {
       try {
         const replies = await syncRadarInbox(radarAccountId);

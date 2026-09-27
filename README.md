@@ -28,6 +28,48 @@ authentication, runtime health, limits, and the managed list/workflow through
 `/api/radar/*`; operators do not need the Linki UI. The routes use the existing
 `x-internal-secret` authentication.
 
+### Managed native conversations
+
+`linkedin-managed-v1` extends Radar contacts with `radar_market_id`. A Radar
+message attempt is durable before browser I/O; an uncertain native receipt
+blocks repetition across restart. The counterparty messaging URN and a send
+button click are never native message receipts. Radar-initiated scope begins
+at the first observed controlled native message. `POST /api/radar/conversations`
+registers only an explicit Radar human claim, authenticated with the private
+service secret, and binds its immutable native thread, account and Mercado.
+
+Recovery fetches only that thread's paginated native events and the account's
+own identity. Each page is queued durably before requesting the next one;
+unknown native shapes, missing pages and unsupported attachment descriptors
+remain visibly partial. Conversation messages use signed `conversation.message`
+callbacks containing full text and native identities. Payloads are redacted only
+after Radar returns `normalizado: true`, and their clock follows the parent
+conversation's 24 months from last contact. A full recovery manifest is accepted
+only after every native message is durable in Radar. No full inbox or address
+book is imported for this protocol. Native provider shape validation and protocol
+installation on connected runtimes remain readiness conditions; this contract
+does not activate sending.
+
+`DELETE /api/radar/conversations` accepts `{ schemaVersion: 1, runtimeKey,
+threadId, scopeId, retirementId }` through the same private service secret.
+It atomically removes only the matching registered scope, its outbox and
+controlled-send copies, then acknowledges `retired: true` (also on exact replay).
+Minimal hashed tombstones survive restart and prevent reuse. A foreign runtime,
+account or scope cannot retire a neighbouring thread. Radar retains its durable
+retirement command until this explicit acknowledgment; an ordinary HTTP success
+or elapsed deadline is not proof of remote content deletion.
+
+Retirement and independent expiry also remove the exact source-context and
+completed-track copies using recorded account, target and track provenance.
+Another live managed scope can retain a shared copy; late writes and retired
+dispatch steps cannot recreate it. Unknown older provenance remains pending
+for explicit cleanup and is never acknowledged as deleted.
+
+Every controlled outbound keeps its exact native account/thread/message-to-intent
+association. Recovery reuses the original dispatch metadata after ACK redaction.
+Later messages preserve the thread's original scope, human claim and history
+boundary; conflicting native associations remain blocked for reconciliation.
+
 ### Four-founder deployment rules
 
 Run four isolated containers. Each container must have exactly one founder
@@ -52,8 +94,8 @@ LINKI_PROXY_SERVER=http://static-residential-host:port
 LINKI_PROXY_USERNAME=<unique proxy user>
 LINKI_PROXY_PASSWORD=<unique proxy password>
 
-RADAR_CALLBACK_URL=https://radar.vitrinadev.com/api/webhooks/v1/omnichannel-callback
-RADAR_CALLBACK_SECRET=<same value as Radar OMNICHANNEL_WEBHOOK_SECRET>
+RADAR_CALLBACK_URL=https://radar.vitrinadev.com/api/webhooks/v1/omnichannel-callback/<endpoint-slug>
+RADAR_CALLBACK_SECRET=<secret of this endpoint-specific Radar webhook credential>
 RADAR_ACCEPTED_SYNC_INTERVAL_MINUTES=5
 RADAR_REPLY_SYNC_INTERVAL_MINUTES=15
 RADAR_RUNTIME_KEY=<short non-secret name of this runtime, e.g. the founder's>

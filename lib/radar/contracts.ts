@@ -33,6 +33,7 @@ export const radarContactSchema = z.object({
   status: z.literal("QUEUED"),
   customAttributes: z.object({
     radar_lead_id: z.string().uuid(),
+    radar_market_id: z.string().uuid().optional(),
     icebreaker_context: z.string().trim().min(1).max(10_000),
   }).strict(),
 }).strict();

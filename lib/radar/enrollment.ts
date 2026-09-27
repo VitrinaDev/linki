@@ -59,16 +59,22 @@ export function enrollRadarContact(
       if (canonicalLinkedInUrl(existingByRadarId.linkedin_url) !== linkedinUrl) {
         throw new RadarEnrollmentError(422, "radar_lead_id is already mapped to another LinkedIn profile");
       }
+      if(input.customAttributes.radar_market_id) {
+        const binding=db.prepare("SELECT radar_market_id FROM targets WHERE id=?").get(existingByRadarId.id) as {radar_market_id:string|null};
+        if(binding.radar_market_id && binding.radar_market_id!==input.customAttributes.radar_market_id)throw new RadarEnrollmentError(422,"Radar market binding is immutable");
+        db.prepare("UPDATE targets SET radar_market_id=? WHERE id=? AND radar_market_id IS NULL").run(input.customAttributes.radar_market_id,existingByRadarId.id);
+      }
       return { id: existingByRadarId.id, status: "QUEUED", alreadyExists: true };
     }
 
-    const target = db.prepare("SELECT id, radar_lead_id FROM targets WHERE linkedin_url = ?").get(linkedinUrl) as
-      | { id: string; radar_lead_id: string | null }
+    const target = db.prepare("SELECT id, radar_lead_id, radar_market_id FROM targets WHERE linkedin_url = ?").get(linkedinUrl) as
+      | { id: string; radar_lead_id: string | null; radar_market_id: string | null }
       | undefined;
     if (target?.radar_lead_id && target.radar_lead_id !== radarLeadId) {
       throw new RadarEnrollmentError(422, "LinkedIn profile is already mapped to another Radar lead");
     }
 
+    if(target?.radar_market_id && input.customAttributes.radar_market_id && target.radar_market_id!==input.customAttributes.radar_market_id)throw new RadarEnrollmentError(422,"Radar market binding is immutable");
     const targetId = target?.id ?? randomUUID();
     const fullName = `${input.firstName} ${input.lastName}`.trim();
     if (target) {
@@ -104,6 +110,7 @@ export function enrollRadarContact(
       );
     }
 
+    if(input.customAttributes.radar_market_id) db.prepare("UPDATE targets SET radar_market_id=? WHERE id=? AND radar_market_id IS NULL").run(input.customAttributes.radar_market_id,targetId);
     db.prepare(`
       INSERT INTO lists (id, name, description, purpose)
       VALUES (?, ?, 'Managed by Radar omnichannel orchestration', 'linkedin')
