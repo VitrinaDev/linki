@@ -53,7 +53,7 @@ before(async () => {
 
   db.prepare(`
     INSERT INTO accounts (id, name, email, daily_connection_limit)
-    VALUES (?, 'Founder One', 'founder@example.com', 20)
+    VALUES (?, 'Founder One', 'founder@example.com', 25)
   `).run(config.accountId);
   db.prepare("INSERT INTO workflows (id, name) VALUES (?, 'Radar LinkedIn')").run(config.workflowId);
   db.prepare(`
@@ -79,7 +79,7 @@ test("enrolls idempotently in the configured Radar run and clamps the account li
   assert.equal(target.linkedin_url, "https://www.linkedin.com/in/ana-perez");
 
   const account = db.prepare("SELECT daily_connection_limit FROM accounts WHERE id = ?").get(config.accountId) as { daily_connection_limit: number };
-  assert.equal(account.daily_connection_limit, 15);
+  assert.equal(account.daily_connection_limit, 20);
   const track = db.prepare("SELECT state FROM run_profile_tracks").get() as { state: string };
   assert.equal(track.state, "pending");
   assert.throws(() => db.prepare("UPDATE targets SET radar_status = 'INVALID' WHERE id = ?").run(first.id));

@@ -75,7 +75,7 @@ export const radarProvisionSchema = z.object({
   ),
   messageDelaySeconds: z.number().int().min(30 * 60).max(7 * 24 * 60 * 60),
   accountPolicy: z.object({
-    dailyConnectionLimit: z.number().int().min(0).max(15),
+    dailyConnectionLimit: z.number().int().min(0).max(20),
     dailyMessageLimit: z.number().int().min(0).max(20),
     dailyInmailLimit: z.literal(0),
     activeHoursStart: z.number().int().min(0).max(22),
@@ -105,7 +105,7 @@ export type RadarReadPolicy = RadarProvisionInput["readPolicy"];
 
 export const radarControlSchema = z.object({
   enabled: z.boolean(),
-  dailyConnectionLimit: z.number().int().min(0).max(15),
+  dailyConnectionLimit: z.number().int().min(0).max(20),
   dailyMessageLimit: z.number().int().min(0).max(20),
   retryFailed: z.boolean().optional().default(false),
   // Clears a durable pause (see RUNTIME_PAUSE_REASONS) in this same request.
