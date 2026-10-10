@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  radarControlSchema,
   buildRadarCallback,
   callbackSignature,
   radarContactSchema,
@@ -54,4 +55,9 @@ test("signs timestamp dot raw body exactly as Radar verifies it", () => {
 test("callback retry delay grows exponentially and caps at one day plus jitter", () => {
   assert.ok(retryDelaySeconds(1) >= 60 && retryDelaySeconds(1) < 72);
   assert.ok(retryDelaySeconds(30) >= 86_400 && retryDelaySeconds(30) < 103_680);
+});
+
+test("the per-profile connection ceiling is 20: Radar ramps 10 to 20 below it", () => {
+  assert.equal(radarControlSchema.safeParse({ enabled: false, dailyConnectionLimit: 20, dailyMessageLimit: 20 }).success, true);
+  assert.equal(radarControlSchema.safeParse({ enabled: false, dailyConnectionLimit: 21, dailyMessageLimit: 20 }).success, false);
 });

@@ -47,9 +47,9 @@ export function enrollRadarContact(
     if (!linkedInTrack) throw new RadarEnrollmentError(503, "Configured Radar workflow has no enabled LinkedIn steps");
 
     // Defence in depth: Radar also rate-limits dispatch, while Linki owns the
-    // authoritative per-account send counter. Never let a Radar runtime exceed 15.
+    // authoritative per-account send counter. Never let a Radar runtime exceed 20 (Radar ramps 10 → 20 per profile).
     db.prepare(
-      "UPDATE accounts SET daily_connection_limit = MIN(COALESCE(daily_connection_limit, 15), 15) WHERE id = ?",
+      "UPDATE accounts SET daily_connection_limit = MIN(COALESCE(daily_connection_limit, 20), 20) WHERE id = ?",
     ).run(config.accountId);
 
     const existingByRadarId = db.prepare(
