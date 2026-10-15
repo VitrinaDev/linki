@@ -44,7 +44,9 @@ for(const motivo of ['respuesta_empresa','opt_out_terminal'])test(`invitation ch
  const empty={first(){return this;},filter(){return this;},count:async()=>0,innerText:async()=>'',locator(){return this;}};
  const direct={...empty,count:async()=>1,getAttribute:async()=>'/custom-invite/ana'};
  const send={...empty,count:async()=>1,click:async()=>{trace.push('native-click');}};
- const page={goto:async()=>{trace.push('prepare');},waitForTimeout:async()=>{},locator:(selector:string)=>selector.includes('Send now')?send:selector.includes('custom-invite')?direct:empty};
+ // The visited person's top card (lib/linkedin/top-card.ts): main → name heading → section, owning the invite link.
+ const card:Record<string,unknown>={first(){return card;},filter(){return card;},count:async()=>1,innerText:async()=>'',waitFor:async()=>{},locator:(selector:string)=>selector.includes('custom-invite')?direct:selector.includes('/messaging/compose')?empty:card};
+ const page={goto:async()=>{trace.push('prepare');},waitForTimeout:async()=>{},title:async()=>'Ana | LinkedIn',locator:(selector:string)=>selector.includes('Send now')?send:selector==='main'?card:empty};
  await assert.rejects(sendConnectionRequest(page as never,'https://www.linkedin.com/in/ana',async()=>{
   trace.push('authority');return await authorizeNativeClick(db,{intentId:controlled.id,targetId:target,pertenenciaId:pertenencia,marketId:market,accountId:account,threadId:null,action:'connection'},{callback:config,runtimeKey:'runtime_fixture',fetchImpl:async(_u,init)=>{calls++;const raw=String(init?.body);assert.equal(JSON.parse(raw).action,'connection');return signed(raw,{admite:false,motivo},Date.now());}});
  }),/denied/);
@@ -107,7 +109,9 @@ test('controlled invitation retains normal actionability; absent callback keeps 
  const empty={first(){return this;},filter(){return this;},count:async()=>0,innerText:async()=>'',locator(){return this;}};
  const direct={...empty,count:async()=>1,getAttribute:async()=>'/custom-invite/ana'};
  const send={...empty,count:async()=>1,click:async(options?:{trial?:boolean;timeout?:number;delay?:number;force?:boolean})=>{operations.push({...options});}};
- const page={goto:async()=>{},waitForTimeout:async()=>{},locator:(selector:string)=>selector.includes('Send now')?send:selector.includes('custom-invite')?direct:empty};
+ // The visited person's top card (lib/linkedin/top-card.ts): main → name heading → section, owning the invite link.
+ const card:Record<string,unknown>={first(){return card;},filter(){return card;},count:async()=>1,innerText:async()=>'',waitFor:async()=>{},locator:(selector:string)=>selector.includes('custom-invite')?direct:selector.includes('/messaging/compose')?empty:card};
+ const page={goto:async()=>{},waitForTimeout:async()=>{},title:async()=>'Ana | LinkedIn',locator:(selector:string)=>selector.includes('Send now')?send:selector==='main'?card:empty};
  await sendConnectionRequest(page as never,'https://www.linkedin.com/in/ana',async()=>({expiresAt:new Date(Date.now()+3000).toISOString()}));
  assert.equal(operations.length,2);assert.equal(operations[0].trial,true);
  for(const operation of operations){assert.ok(operation.timeout!>0&&operation.timeout!<=3000);assert.equal(operation.force,undefined);}
