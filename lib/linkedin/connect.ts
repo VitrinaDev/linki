@@ -1,5 +1,6 @@
 import type { Page } from "playwright";
 import { clickWithNativeAuthority, type NativeClickAuthority } from "../radar/cold-authority";
+import { FIRST_DEGREE, PENDING, locateTopCard } from "./top-card";
 
 export class WeeklyLimitError extends Error {}
 export class AlreadyConnectedError extends Error {}
@@ -28,22 +29,29 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
   // which skipped the real invite AND (via the message step that follows) sent
   // a message to a random unrelated 1st-degree connection instead of the
   // target — see CLAUDE.md / memory for the Jul 2026 incident. The top card is
-  // identified structurally as the section containing the page's own <h1> name
-  // heading, robust to class-name hashing. Mirrors the same fix in visit.ts.
-  const topCard = page.locator("main section").filter({ has: page.locator("h1") }).first();
+  // the nearest section around the person's own name heading (<h1> legacy,
+  // <h2> SDUI), robust to class-name hashing — see top-card.ts. Mirrors
+  // visit.ts. No top card = refuse: never fall back to a page-wide Connect.
+  const located = await locateTopCard(page);
+  if (!located) throw new Error("Profile top card not found — refusing to look for Connect page-wide");
+  const topCard = located.card;
   const hasMessageLink = await topCard.locator('a[href*="/messaging/compose"]').first().count() > 0;
   if (hasMessageLink) throw new AlreadyConnectedError("Already connected");
   const pageText = await topCard.innerText().catch(() => "");
-  if (/\b1st\b/.test(pageText)) throw new AlreadyConnectedError("Already connected");
+  if (FIRST_DEGREE.test(pageText)) throw new AlreadyConnectedError("Already connected");
 
   // Pending?
-  if (/\bPending\b/.test(pageText)) throw new PendingInviteError("Invitation already pending");
-  const pendingBtn = page.locator('button[aria-label*="Pending"]:visible');
+  if (PENDING.test(pageText)) throw new PendingInviteError("Invitation already pending");
+  const pendingBtn = page.locator('button[aria-label*="Pending"]:visible, button[aria-label*="Pendiente"]:visible');
   if (await pendingBtn.count() > 0) throw new PendingInviteError("Invitation already pending");
 
   // Case 1: Direct Connect link (primary CTA) — navigate to its href directly.
   // Clicking fails because the Sales Nav overlay SVG intercepts pointer events.
-  const directConnect = page.locator('a[aria-label*="Invite"][aria-label*="to connect"]:visible, a[href*="custom-invite"]:visible').first();
+  // Scoped to the top card: sidebar modules ("People you may know") render
+  // their own "Invite X to connect" links for OTHER people.
+  const directConnect = topCard.locator(
+    'a[aria-label*="Invite"][aria-label*="to connect"]:visible, a[aria-label*="Invita"][aria-label*="conectar"]:visible, a[href*="custom-invite"]:visible'
+  ).first();
   if (await directConnect.count() > 0) {
     const href = await directConnect.getAttribute("href");
     if (!href) throw new Error("Connect link has no href");
@@ -51,17 +59,20 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
     await page.goto(inviteUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(1000);
   } else {
-    // Case 2: Connect is inside the "..." More menu
-    // LinkedIn has two "More" buttons on page: [0] = nav bar, [1] = profile card
-    const moreBtn = page.locator('button[aria-label="More"]:visible').nth(1);
+    // Case 2: Connect is inside the "..." More menu — the top card's own one.
+    // Never a page-wide "More": the nav bar and sidebar cards have their own.
+    const moreBtn = topCard.locator(
+      'button[aria-label="More"]:visible, button[aria-label="Más"]:visible, button:visible:text-is("More"), button:visible:text-is("Más")'
+    ).first();
+    if (await moreBtn.count() === 0) throw new Error("More button not found in the profile top card");
     await moreBtn.click();
     await page.waitForTimeout(800);
 
     // Check for Pending in the menu — means invite was already sent
-    const pendingMenuItem = page.locator('[role="menuitem"]:has-text("Pending"):visible');
+    const pendingMenuItem = page.locator('[role="menuitem"]:has-text("Pending"):visible, [role="menuitem"]:has-text("Pendiente"):visible');
     if (await pendingMenuItem.count() > 0) throw new PendingInviteError("Invitation already pending (found in More menu)");
 
-    const connectOption = page.locator('[role="menuitem"]:has-text("Connect"):visible');
+    const connectOption = page.locator('[role="menuitem"]:has-text("Connect"):visible, [role="menuitem"]:has-text("Conectar"):visible');
     if (await connectOption.count() === 0) throw new Error("Connect option not found in More menu");
     await connectOption.first().click();
   }
@@ -70,7 +81,8 @@ export async function sendConnectionRequest(page: Page, linkedinUrl: string, bef
 
   // Click "Send without a note" / "Send now"
   const sendBtn = page.locator(
-    'button:has-text("Send now"), button[aria-label*="Send without"], button[aria-label*="Send invitation"]:not([aria-label*="note"])'
+    'button:has-text("Send now"), button[aria-label*="Send without"], button[aria-label*="Send invitation"]:not([aria-label*="note"]), ' +
+    'button:has-text("Enviar ahora"), button[aria-label*="Enviar sin"]'
   );
   if (await sendBtn.count() > 0) {
     if (beforeNativeClick) await clickWithNativeAuthority(sendBtn.first(), beforeNativeClick);

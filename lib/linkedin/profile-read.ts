@@ -48,6 +48,7 @@
  */
 import type { Locator, Page } from "playwright";
 import { getSessionPage } from "@/lib/linkedin/session";
+import { locateTopCard } from "@/lib/linkedin/top-card";
 import type { ProfileReadErrorCode, ProfileReadPosition, ProfileReadResult } from "@/lib/radar/contracts";
 
 export class ProfileReadError extends Error {
@@ -277,31 +278,53 @@ async function firstText(locator: Locator): Promise<string | null> {
 }
 
 /**
- * Top card = the `main` section that owns the page's own <h1>. Same structural
- * identification visit.ts uses, and for the same reason: a page-wide search
- * also matches sidebar modules about OTHER people.
+ * Top card = the nearest `main` section around the person's own name heading
+ * (<h1> legacy, <h2> SDUI) — see top-card.ts, shared with visit.ts and for the
+ * same reason: a page-wide search also matches sidebar modules about OTHER
+ * people.
  */
 async function readTopCard(page: Page): Promise<{ headline: string | null; location: string | null }> {
-  const topCard = page.locator("main section").filter({ has: page.locator("h1") }).first();
-  if ((await topCard.count().catch(() => 0)) === 0) return { headline: null, location: null };
+  const located = await locateTopCard(page);
+  if (!located) return { headline: null, location: null };
+  const topCard = located.card;
 
   // `text-body-medium` / `text-body-small` are LinkedIn's stable semantic
-  // utility classes, not the hashed per-build ones.
+  // utility classes in the legacy layout, not the hashed per-build ones.
   let headline = await firstText(topCard.locator("div.text-body-medium"));
   let location = await firstText(topCard.locator("span.text-body-small:not(:has(a))"));
 
   if (!headline || !location) {
-    const name = (await topCard.locator("h1").first().innerText().catch(() => ""))?.trim();
-    const lines = (await topCard.innerText().catch(() => ""))
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line && line !== name && !/^(1st|2nd|3rd|1°|2°|3°)$/i.test(line));
-    const social = /follower|connection|seguidor|contacto|contact info|informaci[oó]n de contacto|mutual/i;
-    const meaningful = lines.filter((line) => !social.test(line));
-    headline = headline ?? meaningful[0] ?? null;
-    location = location ?? meaningful[1] ?? null;
+    const name = (await located.heading.innerText().catch(() => ""))?.trim();
+    const parsed = topCardLines(await topCard.innerText().catch(() => ""), name);
+    headline = headline ?? parsed.headline;
+    location = location ?? parsed.location;
   }
   return { headline, location };
+}
+
+const DEGREE_LINE = /^[·•\s]*(1st|2nd|3rd\+?|1er|2º|3º|1°|2°|3°|[123]º?\+?)$/i;
+const SOCIAL_LINE = /follower|connection|seguidor|contacto|contact info|informaci[oó]n de contacto|mutual|en com[uú]n/i;
+const CONTACT_LINE = /^(contact info|informaci[oó]n de contacto)$/i;
+
+/**
+ * Line-based reading of a top card, used when the semantic classes are absent
+ * (the SDUI layout hashes every class). Order there is: name, degree badge(s),
+ * headline, optional education/company line, location, "·", Contact info. The
+ * location is the line right before the Contact info link; the headline is the
+ * first line after the name that is neither a badge nor social proof.
+ */
+export function topCardLines(text: string, name?: string | null): { headline: string | null; location: string | null } {
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && line !== name && line !== "·" && line !== "•" && !DEGREE_LINE.test(line));
+  const contactAt = lines.findIndex((line) => CONTACT_LINE.test(line));
+  const location = contactAt > 0 && !SOCIAL_LINE.test(lines[contactAt - 1]) ? lines[contactAt - 1] : null;
+  const meaningful = lines.filter((line) => !SOCIAL_LINE.test(line) && line !== location);
+  return {
+    headline: meaningful[0] ?? null,
+    location: location ?? meaningful[1] ?? null,
+  };
 }
 
 interface VoyagerPosition {

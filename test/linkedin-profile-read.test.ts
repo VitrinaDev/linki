@@ -82,7 +82,7 @@ class FakeLocator {
   async count(): Promise<number> { return this.nodes.length; }
   first(): FakeLocator { return new FakeLocator(this.nodes.slice(0, 1)); }
   nth(index: number): FakeLocator { return new FakeLocator(this.nodes.slice(index, index + 1)); }
-  /** Only used as `.filter({ has: h1 })`; the fake's top card always owns one. */
+  /** Only used as the name-heading `.filter({ hasText })`; the fake's heading always matches. */
   filter(): FakeLocator { return this; }
   async innerText(): Promise<string> {
     if (this.nodes.length === 0) throw new Error("locator resolved to no element");
@@ -104,6 +104,8 @@ class FakePage {
   constructor(private readonly script: Script) {}
 
   url(): string { return this.currentUrl; }
+
+  async title(): Promise<string> { return this.current.name ? `${this.current.name} | LinkedIn` : "LinkedIn"; }
 
   private resolve(url: string): FakePageSpec {
     return this.script.pages.find((entry) => entry.match.test(url))?.page
@@ -156,17 +158,16 @@ class FakePage {
 
   locator(selector: string): FakeLocator {
     if (selector === "body") return new FakeLocator([{ text: this.current.body ?? "" }]);
-    if (selector === "main section") {
+    if (selector === "main") {
+      // top-card.ts: main → name heading → nearest section ancestor.
       const { name, headline, location } = this.current;
-      if (!name && !headline && !location) return new FakeLocator([]);
+      if (!name) return new FakeLocator([{ text: "", children: {} }]);
       const children: Record<string, FakeNode[]> = {};
-      if (name) children["h1"] = [{ text: name }];
       if (headline) children["div.text-body-medium"] = [{ text: headline }];
       if (location) children['span.text-body-small:not(:has(a))'] = [{ text: location }];
-      return new FakeLocator([{
-        text: [name, headline, location].filter(Boolean).join("\n"),
-        children,
-      }]);
+      const section: FakeNode = { text: [name, headline, location].filter(Boolean).join("\n"), children };
+      const heading: FakeNode = { text: name, children: { "xpath=ancestor::section[1]": [section] } };
+      return new FakeLocator([{ text: section.text, children: { "h1, h2": [heading], h1: [heading] } }]);
     }
     if (selector === "main ul > li") {
       return new FakeLocator((this.current.experience ?? []).map((item) => ({
