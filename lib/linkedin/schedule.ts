@@ -35,19 +35,26 @@ export function isWithinSchedule(account: ScheduleConfig): boolean {
   return frac >= (account.active_hours_start ?? 9) && frac < (account.active_hours_end ?? 18);
 }
 
+/**
+ * UTC instant at which the account's active window opens on the account-local
+ * calendar day of `date`. The runtime container runs in UTC, so the window is
+ * never derived from the server's clock.
+ */
+export function activeWindowStartMs(account: ScheduleConfig, date = new Date()): number {
+  return startOfLocalDay(account, date).getTime() + (account.active_hours_start ?? 9) * 3600_000;
+}
+
 export function randomSlotInActiveWindow(account: ScheduleConfig, targetDate?: Date): string {
   const start = account.active_hours_start ?? 9;
   const end = account.active_hours_end ?? 18;
-  const base = targetDate ? new Date(targetDate) : new Date();
-  const startMs = new Date(base.getFullYear(), base.getMonth(), base.getDate(), start, 0, 0).getTime();
-  const endMs   = new Date(base.getFullYear(), base.getMonth(), base.getDate(), end,   0, 0).getTime();
+  const startMs = activeWindowStartMs(account, targetDate ? new Date(targetDate) : new Date());
+  const endMs = startMs + (end - start) * 3600_000;
   return new Date(startMs + Math.random() * (endMs - startMs)).toISOString();
 }
 
+/** A slot in the active window of the next local working day. */
 export function rescheduleToTomorrow(account: ScheduleConfig): string {
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  return randomSlotInActiveWindow(account, tomorrow);
+  return nextWorkingDaySlot(account);
 }
 
 export function nextScheduledSlot(account: ScheduleConfig): string {
