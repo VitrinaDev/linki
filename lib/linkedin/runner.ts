@@ -2,6 +2,7 @@ import { getDb } from "@/lib/db";
 import { randomUUID } from "crypto";
 import { getSessionPage, saveSessionState, getSessionContext } from "@/lib/linkedin/session";
 import {
+  activeWindowStartMs,
   getLocalParts,
   isWithinSchedule,
   nextScheduledSlot,
@@ -1413,7 +1414,7 @@ function spreadEnrollBatch(
   const nowFrac = hour + minute / 60;
   const windowMs = (end - start) * 3600_000;
   const bucketMs = windowMs / batchSize;
-  const dayStartMs = new Date().setHours(start, 0, 0, 0);
+  const dayStartMs = activeWindowStartMs(limits);
 
   for (let i = 0; i < pending.length; i++) {
     const row = pending[i];
